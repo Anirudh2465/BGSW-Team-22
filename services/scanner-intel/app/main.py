@@ -1,4 +1,7 @@
-from fastapi import FastAPI
+from typing import Any, Dict
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 from guardian_contracts.api_schemas import (
     CartographerRequest,
     CartographerResponse,
@@ -12,6 +15,8 @@ from guardian_contracts.api_schemas import (
 from .agents.cartographer import CartographerAgent
 from .agents.discover import DiscoverAgent
 from .agents.detector import DetectorAgent
+from .artifact_client import ArtifactError
+from .vuln import service as vuln_service
 
 app = FastAPI(title="Supply Chain Guardian - Scanner & Intel", version="0.1.0")
 
@@ -40,6 +45,26 @@ def discover(req: DiscoverRequest):
         source_sha256=req.source_artifact_sha256,
         tree_sha256=req.tree_artifact_sha256,
     )
+
+class AssessRequest(BaseModel):
+    run_id: str
+    sbom_artifact_sha256: str
+
+
+@app.post("/assess")
+def assess(req: AssessRequest) -> Dict[str, Any]:
+    """Deterministic vulnerability assessment of one stored CycloneDX SBOM (Grype + OSV-Scanner, no LLM)."""
+    try:
+        result, refs = vuln_service.assess_artifact(req.run_id, req.sbom_artifact_sha256, stage="assess")
+    except vuln_service.SbomNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ArtifactError as exc:  # storing results failed after the scan ran
+        raise HTTPException(status_code=502, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    return {"run_id": req.run_id, "artifacts": refs, "report": result.report,
+            "findings": [f.model_dump() for f in result.findings]}
+
 
 @app.post("/detect", response_model=DetectResponse)
 def detect(req: DetectRequest):

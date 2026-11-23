@@ -1,9 +1,9 @@
 "use client";
 
 import React from "react";
-import { Database, Download, ExternalLink, FileJson, FileText, GitPullRequest, ShieldCheck } from "lucide-react";
+import { Boxes, Database, Download, ExternalLink, FileJson, FileText, GitPullRequest, Package, ShieldCheck, Waypoints } from "lucide-react";
 import { useRun } from "../../../../lib/run-context";
-import { sbomDownloadUrl } from "../../../../lib/api";
+import { artifactDownloadUrl, sbomDownloadUrl } from "../../../../lib/api";
 import { Badge, Card, CardHeader, CopyButton, Hash } from "../../../../components/ui";
 
 export default function ReportsPage() {
@@ -35,6 +35,33 @@ export default function ReportsPage() {
           />
           <div className="flex items-center gap-2 px-5 pb-4 text-xs text-ink-muted">
             sha256 <Hash value={run.sbom_ref} n={32} />
+          </div>
+        </Card>
+
+        <Card>
+          <CardHeader title="Graph artifacts" subtitle="Three separate content-addressed artifacts. None is merged into another." />
+          <div className="grid grid-cols-1 gap-3 px-5 pb-5 md:grid-cols-3">
+            {GRAPH_ARTIFACTS.map((g) => {
+              const a = run.artifacts?.[g.key];
+              return (
+                <div key={g.key} className="flex flex-col rounded-lg bg-white/[0.02] p-4 ring-1 ring-inset ring-white/5">
+                  <div className="flex items-center gap-2 text-ink-soft">
+                    {g.icon}
+                    <span className="text-sm font-medium text-ink">{g.name}</span>
+                  </div>
+                  <div className="mt-0.5 text-[11px] text-ink-muted">{g.format}</div>
+                  <div className="mt-2 flex-1 space-y-0.5 text-[11px] text-ink-muted">{a ? g.facts(a) : "Not produced for this run"}</div>
+                  <div className="mt-3 flex items-center justify-between gap-2">
+                    {a ? <Hash value={a.sha256} n={14} /> : <Badge>missing</Badge>}
+                    {a && (
+                      <a href={artifactDownloadUrl(run.run_id, g.key)} className="inline-flex h-7 items-center gap-1 rounded-lg bg-white/[0.06] px-2.5 text-xs text-ink ring-1 ring-inset ring-white/10 hover:bg-white/[0.1]">
+                        <Download className="h-3.5 w-3.5" /> {a.filename ?? "Download"}
+                      </a>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
           </div>
         </Card>
 
@@ -124,3 +151,41 @@ export default function ReportsPage() {
     </div>
   );
 }
+
+const n = (v: unknown) => (typeof v === "number" ? v.toLocaleString() : "—");
+
+const GRAPH_ARTIFACTS: { key: string; name: string; format: string; icon: React.ReactNode; facts: (a: Record<string, unknown>) => React.ReactNode }[] = [
+  {
+    key: "syft_sbom",
+    name: "Syft SBOM",
+    format: "CycloneDX JSON, byte-for-byte from Syft",
+    icon: <Package className="h-4 w-4" />,
+    facts: (a) => (
+      <>
+        <div>syft {String(a.generator_version ?? "")} · CycloneDX {String(a.spec_version ?? "")}</div>
+        <div>{n(a.components)} components · {n(a.dependencies)} dependency entries</div>
+      </>
+    ),
+  },
+  {
+    key: "package_graph",
+    name: "Package dependency graph",
+    format: "NetworkX node-link JSON · package → package",
+    icon: <Waypoints className="h-4 w-4" />,
+    facts: (a) => <div>{n(a.nodes)} nodes · {n(a.edges)} edges</div>,
+  },
+  {
+    key: "class_graph",
+    name: "Class dependency graph",
+    format: "JavaParser AST + NetworkX · class → class",
+    icon: <Boxes className="h-4 w-4" />,
+    facts: (a) =>
+      a.status === "ok" ? (
+        <div>
+          {n(a.classes)} classes · {n(a.edges)} edges · {n(a.packages)} packages · {n(a.cycles)} cycles
+        </div>
+      ) : (
+        <div>status: {String(a.status).replace(/_/g, " ")}</div>
+      ),
+  },
+];

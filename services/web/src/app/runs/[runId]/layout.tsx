@@ -51,7 +51,8 @@ function RunShell({ children }: { children: React.ReactNode }) {
   const passed = gates.filter((g) => g.passed).length;
   const tabs: { href: string; label: string; count?: number | string; tone?: "danger" }[] = [
     { href: base, label: "Overview" },
-    { href: `${base}/graph`, label: "Dependency graph", count: run.dep_graph_summary?.components },
+    { href: `${base}/graph`, label: "Package graph", count: run.dep_graph_summary?.components },
+    { href: `${base}/classes`, label: "Class graph", count: (run.artifacts?.class_graph?.classes as number | undefined) || undefined },
     { href: `${base}/findings`, label: "Findings", count: findings, tone: findings ? "danger" : undefined },
     { href: `${base}/remediation`, label: "Remediation", count: rems },
     { href: `${base}/pipeline`, label: "Pipeline", count: gates.length ? `${passed}/${gates.length}` : undefined },
@@ -110,11 +111,11 @@ function RunShell({ children }: { children: React.ReactNode }) {
             );
           })}
           <a
-            href={`${base}/graph`}
+            href={pathname.startsWith(`${base}/classes`) ? `${base}/classes` : `${base}/graph`}
             target="_blank"
             rel="noreferrer"
             className="ml-auto flex shrink-0 items-center gap-1 px-2 pb-2.5 pt-1.5 text-xs text-ink-muted hover:text-ink"
-            title="Open the dependency graph in a new browser tab"
+            title="Open this graph in a new browser tab"
           >
             Graph in new tab <ExternalLink className="h-3 w-3" />
           </a>

@@ -122,6 +122,9 @@ services:
       - GITHUB_WRITER_APP_ID=${GITHUB_WRITER_APP_ID:-}
       - GITHUB_WRITER_PRIVATE_KEY_PATH=${GITHUB_WRITER_PRIVATE_KEY_PATH:-/secrets/writer.pem}
       - LAUNCHER_URL=http://launcher:8001
+      # The prioritizer reads the vulnerability enrichment artifact by hash (read-only).
+      - ORCHESTRATOR_URL=http://orchestrator:8000
+      - INTERNAL_API_TOKEN=${INTERNAL_API_TOKEN:-}
     volumes:
       - ./secrets:/secrets:ro
     networks:

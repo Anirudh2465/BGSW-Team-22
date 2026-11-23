@@ -73,6 +73,95 @@ export interface RunData {
     pr_url?: string;
   };
   audit_chain_head: string;
+  artifacts?: Record<string, RunArtifact>;
+}
+
+/** One separately stored, content-addressed artifact (SBOM, package graph, class graph). */
+export interface RunArtifact {
+  sha256: string;
+  media_type: string;
+  filename?: string;
+  title?: string;
+  download?: string;
+  size?: number;
+  [key: string]: unknown;
+}
+
+// ---------------------------------------------------------------- class graph
+export type ClassRelationship = "extends" | "implements" | "field" | "instantiates" | "method" | "calls" | "uses" | "annotation";
+
+export interface ClassNode {
+  id: string;
+  name: string;
+  simple_name: string;
+  package: string;
+  kind: "class" | "interface" | "enum" | "record" | "annotation" | "type" | "external";
+  external: boolean;
+  jdk?: boolean;
+  stereotype: string;
+  abstract?: boolean;
+  file?: string;
+  line?: number;
+  end_line?: number;
+  loc?: number;
+  methods?: number;
+  fields?: number;
+  constructors?: number;
+  annotations?: string[];
+  outer?: string | null;
+  test?: boolean;
+  fan_in: number;
+  fan_out: number;
+  external_deps?: number;
+  pagerank?: number;
+  rank?: number;
+  cycle?: number | null;
+  layer?: number;
+  inheritance_depth?: number;
+  subtypes?: number;
+}
+
+export interface ClassLink {
+  source: string;
+  target: string;
+  relationship: ClassRelationship;
+  relationships: ClassRelationship[];
+  counts: Record<string, number>;
+  weight: number;
+  external: boolean;
+  line?: number;
+}
+
+export interface ClassPackage {
+  id: string;
+  package: string;
+  classes: number;
+  tests: number;
+  afferent: number;
+  efferent: number;
+  instability: number;
+  abstractness: number;
+  distance: number;
+  in_cycle: boolean;
+  loc: number;
+}
+
+export interface ClassGraph {
+  nodes: ClassNode[];
+  links: ClassLink[];
+  graph: {
+    schema: string;
+    language: string;
+    status: string;
+    tool?: { name?: string; version?: string; extractor_version?: string; language_level?: string };
+    metrics: Record<string, any>;
+    cycles: string[][];
+    package_cycles: string[][];
+    packages: ClassPackage[];
+    package_links: { source: string; target: string; weight: number }[];
+    top_unresolved?: { name: string; count: number }[];
+    parse_errors?: { path: string; error: string }[];
+  };
 }
 
 export interface GraphNode {
@@ -171,6 +260,11 @@ export const fetchNeo4j = (runId: string) => request<Neo4jInfo>(`/runs/${encodeU
 
 export const fetchEvents = (runId: string, since = 0) =>
   request<RunEventRecord[]>(`/runs/${encodeURIComponent(runId)}/events?since=${since}`);
+
+export const fetchClassGraph = (runId: string) => request<ClassGraph>(`/runs/${encodeURIComponent(runId)}/class-graph`);
+
+export const artifactDownloadUrl = (runId: string, name: string) =>
+  `${ORCHESTRATOR_URL}/runs/${encodeURIComponent(runId)}/artifacts/${encodeURIComponent(name)}`;
 
 export const fetchHealth = () => request<OrchestratorHealth>("/health");
 

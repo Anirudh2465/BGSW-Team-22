@@ -28,6 +28,9 @@ from app.agents.discover import DiscoverAgent
 from app.artifact_client import InMemoryArtifactClient
 from app.llm.ollama_adapter import scrub_secrets
 from app.main import app
+from app.vuln import service as vuln_service
+from app.vuln.enrich import Feeds
+from app.vuln.scanners import load_recorded
 from app.sbom import purl as P
 from app.sbom.parsers import parse_maven_tree, parse_npm_lockfile, parse_npm_ls, parse_pip_report, parse_uv_lock
 
@@ -259,7 +262,13 @@ def test_discover_fails_closed_without_source(store):
     assert res.gate_passed is False and res.sbom_artifact_sha256 == ""
 
 
-def test_scanner_intel_api_endpoints(store):
+def test_scanner_intel_api_endpoints(store, monkeypatch, tmp_path):
+    # Detection runs the real assessment; feed it the recorded Grype/OSV output and offline feeds.
+    vuln = SERVICE_DIR / "tests" / "fixtures" / "vuln"
+    monkeypatch.setattr(vuln_service, "run_tools", lambda path: {
+        "grype": load_recorded("grype", (vuln / "grype.json").read_bytes()),
+        "osv-scanner": load_recorded("osv-scanner", (vuln / "osv.json").read_bytes())})
+    monkeypatch.setattr(vuln_service, "make_feeds", lambda: Feeds(cache_dir=str(tmp_path), offline=True))
     source_sha = store.add(tar_gz({"pom.xml": POM}))
     bundle_sha = store.add(tar_gz({"resolved/maven/root.json": json.dumps(MAVEN_TREE).encode()}))
     c_res = client.post("/cartographer", json={"run_id": "test-1", "source_artifact_sha256": source_sha})
@@ -278,4 +287,7 @@ def test_scanner_intel_api_endpoints(store):
         "source_artifact_sha256": source_sha,
     })
     assert det_res.status_code == 200
-    assert len(det_res.json()["findings"]) >= 1
+    findings = det_res.json()["findings"]
+    log4shell = [f for f in findings if f["purl"] == LOG4J_CORE and f["explanation"].startswith("CVE-2021-44228 ")]
+    assert len(log4shell) == 1 and log4shell[0]["status"] == "confirmed"
+    assert all(f["purl"] in (LOG4J_CORE, LOG4J_API) for f in findings)  # only components in this SBOM

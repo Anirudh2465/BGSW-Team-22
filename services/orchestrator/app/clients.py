@@ -25,6 +25,11 @@ from guardian_contracts.api_schemas import (
 from guardian_contracts.state import Finding, Evidence, Remediation
 from .config import config
 
+# Detection runs the SBOM vulnerability assessment (Grype + OSV-Scanner + feeds): give it real time.
+# > 2 x VULN_TOOL_TIMEOUT_S (600 s, tools run one after the other) + feed and artifact I/O.
+DETECT_TIMEOUT_S = float(os.getenv("DETECT_TIMEOUT_S", "1500"))
+PRIORITIZE_TIMEOUT_S = float(os.getenv("PRIORITIZE_TIMEOUT_S", "120"))
+
 class ServiceError(RuntimeError):
     """A downstream service failed; the calling node records a failed gate."""
 
@@ -163,16 +168,19 @@ class ServiceClients:
                 gate_passed=True,
                 cross_check_summary={"total_findings": 1}
             )
+        # The SBOM assessment runs Grype + OSV-Scanner and fetches EPSS/KEV, so it takes seconds to
+        # minutes. A failure must never look like "no vulnerabilities": fail the gate, keep the error.
         try:
-            with httpx.Client(timeout=1.0) as client:
+            with httpx.Client(timeout=DETECT_TIMEOUT_S) as client:
                 res = client.post(f"{self.scanner_url}/detect", json=req.model_dump())
+                res.raise_for_status()
                 return DetectResponse(**res.json())
-        except Exception:
+        except Exception as exc:
             return DetectResponse(
                 run_id=req.run_id,
                 findings=[],
-                gate_passed=True,
-                cross_check_summary={"total_findings": 0}
+                gate_passed=False,
+                cross_check_summary={"total_findings": 0, "error": f"detect call failed: {type(exc).__name__}: {exc}"[:300]}
             )
 
     def call_prioritize(self, req: PrioritizeRequest) -> PrioritizeResponse:
@@ -183,14 +191,16 @@ class ServiceClients:
                 gate_passed=True
             )
         try:
-            with httpx.Client(timeout=1.0) as client:
+            with httpx.Client(timeout=PRIORITIZE_TIMEOUT_S) as client:
                 res = client.post(f"{self.remediation_url}/prioritize", json=req.model_dump())
+                res.raise_for_status()
                 return PrioritizeResponse(**res.json())
         except Exception:
+            # Unscored findings must not pass the Grounding gate.
             return PrioritizeResponse(
                 run_id=req.run_id,
                 prioritized_findings=req.findings,
-                gate_passed=True
+                gate_passed=False
             )
 
     def call_policy(self, req: PolicyRequest) -> PolicyResponse:

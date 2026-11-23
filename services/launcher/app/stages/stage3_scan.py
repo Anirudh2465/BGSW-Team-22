@@ -1,12 +1,14 @@
 """Stage 3: offline scan (--network=none, Invariant 1).
 
 Input: the source tarball plus the stage-2 resolved trees.
-Runs Syft, Trivy and cdxgen to produce CycloneDX SBOMs, and TruffleHog (no
-verification, so it contacts nothing) for secrets.
+Runs Syft, Trivy and cdxgen to produce CycloneDX SBOMs, TruffleHog (no
+verification, so it contacts nothing) for secrets, and the JavaParser class-graph
+extractor, which emits AST facts (types and type references, never source text).
 
 Output: one "discovery bundle" artifact that `discover_agent` consumes:
     resolved/...          stage-2 trees, copied verbatim
     sbom/<tool>.cdx.json  scanner SBOMs
+    codegraph/java.json   JavaParser AST facts for the class dependency graph
     secrets.jsonl         TruffleHog findings
     manifest.json         tool status, input hashes
 """
@@ -21,12 +23,13 @@ from ..tarballs import build_tar, read_members
 from .common import sandbox_output_files, tail
 
 SCAN_TIMEOUT_S = int(os.getenv("STAGE3_TIMEOUT_S", "900"))
-SCANNERS = ("syft", "trivy", "cdxgen", "trufflehog")
+SCANNERS = ("syft", "trivy", "cdxgen", "trufflehog", "javaparser")
+CODEGRAPH_FILES = ("codegraph/java.json",)
 
 SCAN_SCRIPT = r"""
 set -u
 exec 3>&1 1>&2
-mkdir -p "$HOME" /workspace/in /workspace/out/sbom /workspace/out/status /workspace/cache
+mkdir -p "$HOME" /workspace/in /workspace/out/sbom /workspace/out/codegraph /workspace/out/status /workspace/cache
 tar -xzf - -C /workspace/in
 SRC=/workspace/in/src
 mark() { echo "$2" > "/workspace/out/status/$1"; }
@@ -44,6 +47,8 @@ if command -v trufflehog >/dev/null 2>&1; then
   if timeout 600 trufflehog filesystem "$SRC" --no-verification --no-update --json > /workspace/out/secrets.jsonl; then
     mark trufflehog ok; else mark trufflehog fail; fi
 else mark trufflehog missing; fi
+if [ -z "$(find "$SRC" -name '*.java' -type f 2>/dev/null | head -n 1)" ]; then mark javaparser skipped
+else run javaparser javaparser "$SRC" /workspace/out/codegraph/java.json; fi
 
 tar -cf - -C /workspace/out . >&3
 """
@@ -102,6 +107,7 @@ def run_stage3_scan(run_id: str, source_sha256: str, parameters: Dict[str, Any],
     tool_status = {t: out.pop(f"status/{t}", b"missing").decode().strip() for t in SCANNERS}
     sboms = {p: d for p, d in out.items() if p.startswith("sbom/") and p.endswith(".json") and d.strip()}
     secrets = redact_trufflehog(out.get("secrets.jsonl", b""))
+    codegraph = {p: out[p] for p in CODEGRAPH_FILES if out.get(p, b"").strip()}
 
     manifest = {
         "run_id": run_id,
@@ -110,15 +116,17 @@ def run_stage3_scan(run_id: str, source_sha256: str, parameters: Dict[str, Any],
         "network_mode": result.network_mode,
         "tool_status": tool_status,
         "sboms": sorted(sboms),
+        "codegraph": sorted(codegraph),
         "exit_code": result.exit_code,
     }
     bundle_files = {p: (d, False) for p, d in tree_files.items()}
     bundle_files.update({p: (d, False) for p, d in sboms.items()})
+    bundle_files.update({p: (d, False) for p, d in codegraph.items()})
     bundle_files["secrets.jsonl"] = (secrets, False)
     bundle_files["manifest.json"] = (json.dumps(manifest, sort_keys=True, indent=1).encode(), False)
     bundle_sha256 = store.put(build_tar(bundle_files))
 
-    ok = result.exit_code == 0 and any(s == "ok" for t, s in tool_status.items() if t != "trufflehog")
+    ok = result.exit_code == 0 and any(s == "ok" for t, s in tool_status.items() if t in ("syft", "trivy", "cdxgen"))
     return {
         "status": "success" if ok else "failure",
         "raw_scan_artifact_sha256": bundle_sha256,
@@ -128,6 +136,7 @@ def run_stage3_scan(run_id: str, source_sha256: str, parameters: Dict[str, Any],
         "stderr_tail": tail(result.stderr),
         "metrics": {
             "sbom_count": len(sboms),
+            "codegraph_files": len(codegraph),
             "secrets_found": sum(1 for line in secrets.splitlines() if line.strip()),
             "duration_ms": result.duration_ms,
         },

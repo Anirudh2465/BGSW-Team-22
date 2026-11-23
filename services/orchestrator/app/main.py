@@ -20,12 +20,14 @@ from .db.artifacts import artifact_store
 from .db.audit_chain import audit_chain
 from .db import neo4j_store
 from .graph.builder import graph_runner
+from .graph.nodes import graph_artifacts
 
 app = FastAPI(title="Supply Chain Guardian - Orchestrator Gateway", version="0.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.getenv("CORS_ORIGINS", "http://localhost:3000").split(","),
     allow_methods=["GET", "POST"],
+    expose_headers=["X-Artifact-SHA256", "Content-Disposition"],
     allow_headers=["*"],
 )
 
@@ -168,6 +170,7 @@ def get_run(run_id: str):
         "sbom_ref": state.get("sbom_ref"),
         "coverage": state.get("coverage", {}),
         "dep_graph_summary": graph_meta.get("metrics", {}),
+        "artifacts": _artifact_index(state),
         "findings": state["findings"],
         "policy_verdicts": state["policy_verdicts"],
         "remediations": state["remediations"],
@@ -219,6 +222,64 @@ def get_run_sbom(run_id: str):
         raise HTTPException(status_code=404, detail="SBOM not available yet")
     return Response(content=data, media_type="application/vnd.cyclonedx+json",
                     headers={"Content-Disposition": f'attachment; filename="{run_id}.cdx.json"'})
+
+
+# Downloadable run artifacts. Each is a separate content-addressed blob; none is merged into another.
+ARTIFACT_FILES = {
+    "sbom": ("application/vnd.cyclonedx+json", "consensus.cdx.json", "Consensus SBOM (Syft + Trivy + cdxgen, resolved trees)"),
+    "syft_sbom": ("application/vnd.cyclonedx+json", "syft.cdx.json", "Syft SBOM (CycloneDX)"),
+    "package_graph": ("application/json", "package-graph.json", "Package dependency graph (NetworkX node-link)"),
+    "class_graph": ("application/json", "class-graph.json", "Class dependency graph (JavaParser + NetworkX)"),
+}
+
+
+def _artifact_index(state: GuardianState) -> Dict[str, Dict[str, Any]]:
+    index: Dict[str, Dict[str, Any]] = {}
+    if state.get("sbom_ref"):
+        index["sbom"] = {"sha256": state["sbom_ref"], "media_type": ARTIFACT_FILES["sbom"][0]}
+    index.update({k: dict(v) for k, v in graph_artifacts(state.get("dep_graph") or {}).items()})
+    for name, meta in index.items():
+        media, filename, title = ARTIFACT_FILES.get(name, ("application/octet-stream", f"{name}.bin", name))
+        meta.setdefault("media_type", media)
+        meta["filename"] = filename
+        meta["title"] = title
+        meta["download"] = f"/runs/{state['run_id']}/artifacts/{name}"
+    return index
+
+
+def _artifact_bytes(run_id: str, name: str) -> tuple:
+    if run_id not in RUNS_DB:
+        raise HTTPException(status_code=404, detail="Run not found")
+    meta = _artifact_index(RUNS_DB[run_id]).get(name)
+    if not meta:
+        raise HTTPException(status_code=404, detail=f"artifact '{name}' not available for this run")
+    data = artifact_store.get(meta["sha256"])
+    if data is None:
+        raise HTTPException(status_code=404, detail="artifact content missing from the store")
+    return data, meta
+
+
+@app.get("/runs/{run_id}/artifacts")
+def list_run_artifacts(run_id: str):
+    if run_id not in RUNS_DB:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return _artifact_index(RUNS_DB[run_id])
+
+
+@app.get("/runs/{run_id}/artifacts/{name}")
+def download_run_artifact(run_id: str, name: str):
+    data, meta = _artifact_bytes(run_id, name)
+    return Response(content=data, media_type=meta["media_type"], headers={
+        "Content-Disposition": f'attachment; filename="{run_id}.{meta["filename"]}"',
+        "X-Artifact-SHA256": meta["sha256"],
+    })
+
+
+@app.get("/runs/{run_id}/class-graph")
+def get_run_class_graph(run_id: str):
+    """Class dependency graph (node-link JSON) for the dashboard; served from its own artifact."""
+    data, meta = _artifact_bytes(run_id, "class_graph")
+    return Response(content=data, media_type="application/json", headers={"X-Artifact-SHA256": meta["sha256"]})
 
 
 @app.get("/runs/{run_id}/events")

@@ -1,3 +1,4 @@
+import json
 from typing import List, Dict, Any, Optional
 from guardian_contracts.state import Finding
 from guardian_contracts.api_schemas import PrioritizeRequest, PrioritizeResponse
@@ -20,28 +21,70 @@ def calculate_deterministic_risk_score(cvss: float, epss: float, kev: int, reach
     raw_score = 40.0 * (cvss / 10.0) + 25.0 * epss + 15.0 * float(kev) + float(r)
     return int(round(max(0, min(100, raw_score))))
 
+ENRICHMENT_TOOL = "guardian-enrichment"
+ENRICHMENT_SCHEMA = "guardian.vuln-enrichment/1"
+
+
 class PrioritizerAgent:
-    """Assigns reachability tiers, evaluates deterministic scores, and enforces Grounding gate."""
+    """Scores findings with the deterministic formula and enforces the Grounding gate.
+
+    CVE findings: CVSS, EPSS and KEV come from the enrichment artifact that scanner-intel's SBOM
+    assessment stored (referenced by the finding's ``guardian-enrichment`` evidence, by SHA-256).
+    Nothing is hardcoded here; values a feed could not supply ("unknown") count as 0.
+    Non-CVE findings keep the fixed starting score their detector set.
+    A finding that has neither cannot be scored, so the Grounding gate fails (closed).
+    """
+
+    def __init__(self, artifacts=None):
+        self._artifacts = artifacts
+
+    @property
+    def artifacts(self):
+        if self._artifacts is not None:
+            return self._artifacts
+        from .. import artifact_client
+        return artifact_client.artifact_client
+
+    def _enrichment(self, sha256: str, cache: Dict[str, Optional[Dict[str, Any]]]) -> Optional[Dict[str, Any]]:
+        if sha256 not in cache:
+            try:
+                data = json.loads(self.artifacts.get(sha256))
+                cache[sha256] = data if isinstance(data, dict) and data.get("schema") == ENRICHMENT_SCHEMA else None
+            except Exception:  # unreachable or unreadable: the finding stays unscored
+                cache[sha256] = None
+        return cache[sha256]
 
     def prioritize_findings(self, run_id: str, findings: List[Finding]) -> PrioritizeResponse:
         updated: List[Finding] = []
+        cache: Dict[str, Optional[Dict[str, Any]]] = {}
         for f in findings:
-            # Deterministic calculation: Log4Shell default cvss=10.0, epss=0.97, kev=1, reach_tier=1
-            cvss = 10.0 if "log4j" in f.purl else 7.5
-            epss = 0.97 if "log4j" in f.purl else 0.4
-            kev = 1 if "log4j" in f.purl else 0
-            computed_score = calculate_deterministic_risk_score(
-                cvss=cvss,
-                epss=epss,
-                kev=kev,
-                reach_tier=f.reach_tier or 1,
-                tier1_no_path=False
-            )
-            f_copy = f.model_copy(update={
-                "score": computed_score,
-                "explanation": f"CVSS {cvss}, EPSS {epss}, KEV {kev}, Reach Tier {f.reach_tier or 1}. Evidence IDs: {', '.join(e.id for e in f.evidence)}"
-            })
-            updated.append(f_copy)
+            ev = next((e for e in f.evidence if e.tool == ENRICHMENT_TOOL), None)
+            entry = None
+            if ev is not None:
+                data = self._enrichment(ev.artifact_sha256, cache)
+                entry = (data or {}).get("advisories", {}).get(f.id)
+            if entry is not None:
+                cvss = entry.get("cvss_score")
+                epss = entry.get("epss")
+                kev = entry.get("kev")
+                score = calculate_deterministic_risk_score(
+                    cvss=float(cvss) if isinstance(cvss, (int, float)) else 0.0,
+                    epss=float(epss) if isinstance(epss, (int, float)) and not isinstance(epss, bool) else 0.0,
+                    kev=int(kev) if isinstance(kev, int) and not isinstance(kev, bool) else 0,
+                    reach_tier=f.reach_tier,
+                    tier1_no_path=False,
+                )
+                explanation = f.explanation or (
+                    f"CVSS {cvss}, EPSS {epss}, KEV {kev}, reach tier {f.reach_tier or 'not analysed'}. "
+                    f"Evidence IDs: {', '.join(e.id for e in f.evidence)}"
+                )
+                updated.append(f.model_copy(update={"score": score, "explanation": explanation}))
+            elif ev is not None:
+                # Enrichment evidence that cannot be read (unreachable, hash mismatch, wrong schema, no entry):
+                # never trust the score that came with the request; leave it unscored so Grounding fails.
+                updated.append(f.model_copy(update={"score": None}))
+            else:
+                updated.append(f)  # non-CVE detector score (install hook 90, confusion 85, ...), or unscored
 
         # Grounding Gate: Every finding has evidence and deterministic score in [0, 100]
         grounding_passed = all(

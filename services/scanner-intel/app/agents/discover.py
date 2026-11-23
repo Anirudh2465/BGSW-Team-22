@@ -12,6 +12,14 @@ Coverage per ecosystem:
 - "single_source": only scanner SBOMs saw components for that ecosystem
 - "skipped":       a manifest was found but no source produced components
 The gate passes when no detected ecosystem is skipped.
+
+Graph artifacts. Three outputs are stored as separate content-addressed artifacts and
+are deliberately NOT merged:
+- ``syft_sbom``:     Syft's own CycloneDX SBOM, byte-for-byte as the scan sandbox wrote it
+- ``package_graph``: the package-to-package dependency graph (NetworkX node-link JSON)
+- ``class_graph``:   the Java class dependency graph built from JavaParser AST facts
+Their hashes are referenced from ``dep_graph.graph.artifacts``; the merged consensus SBOM
+used by the detector stays in ``sbom_ref`` as before.
 """
 
 import posixpath
@@ -21,6 +29,7 @@ from guardian_contracts.api_schemas import DiscoverResponse
 
 from .. import artifact_client as artifacts
 from ..artifact_client import ArtifactError
+from ..codegraph import CLASS_GRAPH_SCHEMA, class_graph_payload
 from ..sbom import parsers
 from ..sbom.graph_builder import SCANNERS, build_dependency_graph, canonical_json, graph_to_payload
 from ..sbom.parsers import ResolvedTree
@@ -28,6 +37,8 @@ from ..source_tree import SourceTree, is_vendored
 
 ECOSYSTEM_PURL_TYPE = {"maven": "maven", "npm": "npm", "pypi": "pypi", "golang": "golang", "cargo": "cargo"}
 CYCLONEDX_MEDIA_TYPE = "application/vnd.cyclonedx+json"
+JSON_MEDIA_TYPE = "application/json"
+PACKAGE_GRAPH_SCHEMA = "guardian.package-graph/1"
 
 
 def _module_label(stem: str) -> str:
@@ -85,6 +96,14 @@ class DiscoverAgent:
         except ArtifactError as exc:
             return self._failed(run_id, f"could not store merged SBOM: {exc}")
 
+        artifacts_meta: Dict[str, Any] = {}
+        syft_meta = self._syft_sbom(run_id, bundle, errors)
+        if syft_meta:
+            artifacts_meta["syft_sbom"] = syft_meta
+        class_meta = self._class_graph(run_id, bundle, scanner_status, errors)
+        if class_meta:
+            artifacts_meta["class_graph"] = class_meta
+
         graph.graph["metrics"].update({
             "detected_ecosystems": detected,
             "skipped_ecosystems": skipped,
@@ -93,10 +112,23 @@ class DiscoverAgent:
             "errors": errors,
         })
         graph.graph["sbom_sha256"] = sbom_sha256
+        graph.graph["schema"] = PACKAGE_GRAPH_SCHEMA
+        package_payload = graph_to_payload(graph)
+        package_bytes = canonical_json(package_payload)
+        try:
+            artifacts_meta["package_graph"] = {
+                "sha256": artifacts.artifact_client.put(run_id, "discover", JSON_MEDIA_TYPE, package_bytes),
+                "media_type": JSON_MEDIA_TYPE, "schema": PACKAGE_GRAPH_SCHEMA,
+                "nodes": graph.number_of_nodes(), "edges": graph.number_of_edges(), "size": len(package_bytes),
+            }
+        except ArtifactError as exc:
+            errors.append(f"could not store package graph: {exc}")
+        # The artifact index is attached to the state copy only; each artifact stays self-contained.
+        dep_graph = {**package_payload, "graph": {**package_payload.get("graph", {}), "artifacts": artifacts_meta}}
         return DiscoverResponse(
             run_id=run_id,
             sbom_artifact_sha256=sbom_sha256,
-            dep_graph=graph_to_payload(graph),
+            dep_graph=dep_graph,
             coverage=coverage,
             gate_passed=gate_passed,
         )
@@ -166,6 +198,56 @@ class DiscoverAgent:
             else:
                 status[tool] = "unparseable"
         return sboms, status
+
+    # --------------------------------------------------------------- artifacts
+    def _syft_sbom(self, run_id: str, bundle: Dict[str, bytes], errors: List[str]) -> Optional[Dict[str, Any]]:
+        """Syft's CycloneDX SBOM as its own artifact (unchanged bytes, so its hash is Syft's output)."""
+        raw = bundle.get("sbom/syft.cdx.json")
+        if not raw:
+            return None
+        data = parsers.load_json(raw)
+        if not isinstance(data, dict) or data.get("bomFormat") != "CycloneDX":
+            errors.append("syft SBOM is not CycloneDX JSON")
+            return None
+        tools = (data.get("metadata") or {}).get("tools") or {}
+        tool_list = tools.get("components", []) if isinstance(tools, dict) else tools
+        version = next((t.get("version") for t in tool_list if isinstance(t, dict) and t.get("name") == "syft"), None)
+        try:
+            sha = artifacts.artifact_client.put(run_id, "scan", CYCLONEDX_MEDIA_TYPE, raw)
+        except ArtifactError as exc:
+            errors.append(f"could not store syft SBOM: {exc}")
+            return None
+        return {
+            "sha256": sha, "media_type": CYCLONEDX_MEDIA_TYPE, "format": "CycloneDX",
+            "spec_version": data.get("specVersion"), "generator": "syft", "generator_version": version,
+            "components": len(data.get("components") or []), "dependencies": len(data.get("dependencies") or []),
+            "size": len(raw),
+        }
+
+    def _class_graph(self, run_id: str, bundle: Dict[str, bytes], tool_status: Dict[str, str],
+                     errors: List[str]) -> Optional[Dict[str, Any]]:
+        """Class dependency graph from the sandbox's JavaParser facts, as its own artifact."""
+        raw_bytes = bundle.get("codegraph/java.json")
+        raw = parsers.load_json(raw_bytes) if raw_bytes else None
+        status = tool_status.get("javaparser", "missing")
+        try:
+            payload = class_graph_payload(raw if isinstance(raw, dict) else None, status)
+        except Exception as exc:  # a bad extractor output must not stop discovery
+            errors.append(f"class graph: {type(exc).__name__}: {exc}")
+            payload = class_graph_payload(None, "failed")
+        content = canonical_json(payload)
+        try:
+            sha = artifacts.artifact_client.put(run_id, "discover", JSON_MEDIA_TYPE, content)
+        except ArtifactError as exc:
+            errors.append(f"could not store class graph: {exc}")
+            return None
+        meta = payload.get("graph", {})
+        m = meta.get("metrics", {})
+        return {
+            "sha256": sha, "media_type": JSON_MEDIA_TYPE, "schema": CLASS_GRAPH_SCHEMA, "language": "java",
+            "status": meta.get("status"), "classes": m.get("classes", 0), "edges": m.get("internal_edges", 0),
+            "packages": m.get("packages", 0), "cycles": m.get("cycles", 0), "size": len(content),
+        }
 
     @staticmethod
     def _failed(run_id: str, reason: str) -> DiscoverResponse:

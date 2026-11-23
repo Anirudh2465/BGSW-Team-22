@@ -45,7 +45,7 @@ export default function OverviewPage() {
                 <Waypoints className="h-5 w-5" />
               </span>
               <div>
-                <h3 className="text-sm font-semibold text-ink">Dependency graph</h3>
+                <h3 className="text-sm font-semibold text-ink">Dependency graphs</h3>
                 <p className="mt-0.5 text-xs text-ink-muted">
                   {graph?.dep_graph?.nodes?.length
                     ? `Explore ${m.components?.toLocaleString() ?? graph.dep_graph.nodes.length} packages: layered, radial and force layouts, path tracing, blast radius and filters.`
@@ -62,8 +62,13 @@ export default function OverviewPage() {
               >
                 New tab <ExternalLink className="h-3.5 w-3.5" />
               </a>
+              {run.artifacts?.class_graph?.status === "ok" && (
+                <Link href={`${base}/classes`} className="inline-flex h-9 items-center gap-1.5 rounded-lg bg-white/[0.06] px-3.5 text-sm font-medium text-ink ring-1 ring-inset ring-white/10 hover:bg-white/[0.1]">
+                  Class graph · {String(run.artifacts.class_graph.classes)}
+                </Link>
+              )}
               <Link href={`${base}/graph`} className="inline-flex h-9 items-center gap-1.5 rounded-lg bg-accent px-3.5 text-sm font-medium text-white hover:bg-accent/90">
-                Open graph <ArrowRight className="h-4 w-4" />
+                Package graph <ArrowRight className="h-4 w-4" />
               </Link>
             </div>
           </div>

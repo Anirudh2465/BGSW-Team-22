@@ -1,0 +1,140 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.5",
+  "version": 1,
+  "metadata": {
+    "tools": {
+      "components": [
+        {
+          "type": "application",
+          "name": "supply-chain-guardian",
+          "version": "0.2.0"
+        }
+      ]
+    },
+    "component": {
+      "type": "application",
+      "bom-ref": "app",
+      "name": "sample-app"
+    }
+  },
+  "components": [
+    {
+      "type": "library",
+      "bom-ref": "pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1",
+      "name": "log4j-core",
+      "purl": "pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1",
+      "properties": [
+        {
+          "name": "guardian:sources",
+          "value": "resolved:test"
+        }
+      ],
+      "group": "org.apache.logging.log4j",
+      "version": "2.14.1"
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.9.10",
+      "name": "jackson-databind",
+      "purl": "pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.9.10",
+      "properties": [
+        {
+          "name": "guardian:sources",
+          "value": "resolved:test"
+        }
+      ],
+      "group": "com.fasterxml.jackson.core",
+      "version": "2.9.10"
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:npm/lodash@4.17.15",
+      "name": "lodash",
+      "purl": "pkg:npm/lodash@4.17.15",
+      "properties": [
+        {
+          "name": "guardian:sources",
+          "value": "resolved:test"
+        }
+      ],
+      "version": "4.17.15"
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/requests@2.25.0",
+      "name": "requests",
+      "purl": "pkg:pypi/requests@2.25.0",
+      "properties": [
+        {
+          "name": "guardian:sources",
+          "value": "resolved:test"
+        }
+      ],
+      "version": "2.25.0"
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:maven/org.slf4j/slf4j-api@2.0.16",
+      "name": "slf4j-api",
+      "purl": "pkg:maven/org.slf4j/slf4j-api@2.0.16",
+      "properties": [
+        {
+          "name": "guardian:sources",
+          "value": "resolved:test"
+        }
+      ],
+      "group": "org.slf4j",
+      "version": "2.0.16"
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:npm/internal-build-tool",
+      "name": "internal-build-tool",
+      "purl": "pkg:npm/internal-build-tool",
+      "properties": [
+        {
+          "name": "guardian:sources",
+          "value": "resolved:test"
+        }
+      ]
+    }
+  ],
+  "dependencies": [
+    {
+      "ref": "app",
+      "dependsOn": [
+        "pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1",
+        "pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.9.10",
+        "pkg:npm/lodash@4.17.15",
+        "pkg:pypi/requests@2.25.0",
+        "pkg:maven/org.slf4j/slf4j-api@2.0.16",
+        "pkg:npm/internal-build-tool"
+      ]
+    },
+    {
+      "ref": "pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.9.10",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:npm/lodash@4.17.15",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:pypi/requests@2.25.0",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:maven/org.slf4j/slf4j-api@2.0.16",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:npm/internal-build-tool",
+      "dependsOn": []
+    }
+  ]
+}

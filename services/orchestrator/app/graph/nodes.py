@@ -82,6 +82,12 @@ def gate_attempts(state: GuardianState, gate_name: str) -> int:
     return sum(1 for g in state.get("gate_results", []) if g.get("gate") == gate_name)
 
 
+def graph_artifacts(dep_graph: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """The separate graph artifacts discover produced: syft_sbom, package_graph, class_graph."""
+    arts = ((dep_graph or {}).get("graph") or {}).get("artifacts") or {}
+    return {k: v for k, v in arts.items() if isinstance(v, dict)}
+
+
 def _pull(run_id: str, stage: str, sha: Optional[str], media_type: str) -> None:
     """Copy a launcher artifact into the orchestrator store, verifying its hash."""
     if not sha or service_clients.mock_mode or artifact_store.exists(sha):
@@ -223,7 +229,11 @@ def discover_node(state: GuardianState) -> Dict[str, Any]:
     ) if resp.dep_graph.get("nodes") else {"exported": False, "reason": "empty graph"}
     delta = _record(state, "discover_node", gate, {
         "stage": "discover",
-        "artifacts": {"sbom": resp.sbom_artifact_sha256} if resp.sbom_artifact_sha256 else {},
+        # Every graph artifact is referenced by hash in the hash-chained audit entry (Invariant 6).
+        "artifacts": {
+            **({"sbom": resp.sbom_artifact_sha256} if resp.sbom_artifact_sha256 else {}),
+            **{name: meta["sha256"] for name, meta in graph_artifacts(resp.dep_graph).items() if meta.get("sha256")},
+        },
         "edges_persisted": stored_edges,
         "neo4j": neo4j_result,
     })

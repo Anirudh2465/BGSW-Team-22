@@ -396,3 +396,41 @@ def test_neo4j_endpoint_gives_browser_links():
     assert data["enabled"] is False and data["export"]["exported"] is False
     assert data["queries"][0]["url"].startswith("http://localhost:7474/browser/?cmd=edit&arg=")
     assert run_id in data["queries"][0]["cypher"]
+
+
+def test_graph_artifacts_are_separate_audited_and_downloadable(fake, monkeypatch):
+    """discover's Syft SBOM, package graph and class graph stay separate artifacts, referenced by hash."""
+    services = fake()
+    syft = b'{"bomFormat": "CycloneDX", "specVersion": "1.6", "components": []}'
+    pkg_graph = b'{"graph": {"schema": "guardian.package-graph/1"}, "links": [], "nodes": []}'
+    cls_graph = b'{"graph": {"schema": "guardian.class-graph/1", "status": "ok"}, "links": [], "nodes": [{"id": "a.A"}]}'
+
+    def call_discover(req):
+        services.calls.append(("discover", req.tree_artifact_sha256))
+        arts = {}
+        for name, blob in (("syft_sbom", syft), ("package_graph", pkg_graph), ("class_graph", cls_graph)):
+            arts[name] = {"sha256": artifact_store.put(req.run_id, "discover", "application/json", blob)}
+        arts["class_graph"].update({"status": "ok", "classes": 1})
+        dep_graph = {**MOCK_DEP_GRAPH, "graph": {**MOCK_DEP_GRAPH.get("graph", {}), "artifacts": arts}}
+        return DiscoverResponse(run_id=req.run_id, sbom_artifact_sha256=artifact_store.put(req.run_id, "discover",
+                                "application/vnd.cyclonedx+json", b"consensus"), dep_graph=dep_graph,
+                                coverage={"maven": "scanned"}, gate_passed=True)
+
+    monkeypatch.setattr(service_clients, "call_discover", call_discover)
+    run_id, data = _start()
+    assert set(data["artifacts"]) == {"sbom", "syft_sbom", "package_graph", "class_graph"}
+    assert len({a["sha256"] for a in data["artifacts"].values()}) == 4
+
+    # The hash-chained audit entry for discover references every artifact.
+    entry = next(e for e in RUNS_DB[run_id]["audit_log"] if e.get("stage") == "discover")
+    assert set(entry["artifacts"]) == {"sbom", "syft_sbom", "package_graph", "class_graph"}
+
+    listing = client.get(f"/runs/{run_id}/artifacts").json()
+    assert listing["syft_sbom"]["filename"] == "syft.cdx.json"
+    res = client.get(f"/runs/{run_id}/artifacts/syft_sbom")
+    assert res.status_code == 200 and res.content == syft
+    assert res.headers["x-artifact-sha256"] == sha(syft)
+    assert client.get(f"/runs/{run_id}/class-graph").json()["nodes"] == [{"id": "a.A"}]
+    assert client.get(f"/runs/{run_id}/artifacts/nope").status_code == 404
+    # State itself was not polluted with presentation fields.
+    assert "download" not in RUNS_DB[run_id]["dep_graph"]["graph"]["artifacts"]["syft_sbom"]
