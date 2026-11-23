@@ -1,0 +1,169 @@
+// Typed client for the orchestrator gateway.
+// NEXT_PUBLIC_* values are inlined at build time; the browser calls the orchestrator directly.
+
+export const ORCHESTRATOR_URL =
+  process.env.NEXT_PUBLIC_ORCHESTRATOR_URL?.replace(/\/$/, "") || "http://localhost:8000";
+export const ORCHESTRATOR_WS_URL =
+  process.env.NEXT_PUBLIC_ORCHESTRATOR_WS_URL?.replace(/\/$/, "") ||
+  ORCHESTRATOR_URL.replace(/^http/, "ws");
+
+export interface Evidence {
+  id: string;
+  tool: string;
+  artifact_sha256: string;
+}
+
+export interface Finding {
+  id: string;
+  kind: string;
+  purl: string;
+  path: string[];
+  evidence: Evidence[];
+  status: "confirmed" | "unconfirmed";
+  reach_tier?: 1 | 2 | 3 | null;
+  score?: number | null;
+  explanation?: string | null;
+}
+
+export interface Remediation {
+  finding_id: string;
+  candidates: string[];
+  chosen?: number | null;
+  patch_sha256?: string | null;
+  validation?: Record<string, unknown> | null;
+  retry_count: number;
+  state: "draft" | "verified" | "no_safe_fix" | "escalated";
+}
+
+export interface GateResult {
+  gate: string;
+  passed: boolean;
+  reason?: string | null;
+  error?: string;
+  action?: string | null;
+  attempt?: number;
+  [key: string]: unknown;
+}
+
+export type CoverageStatus = "scanned" | "single_source" | "skipped";
+export type RunStatus = "queued" | "running" | "completed" | "stopped" | "error";
+
+export interface RunData {
+  run_id: string;
+  status: RunStatus;
+  error?: string | null;
+  current_node?: string | null;
+  repo_url: string;
+  commit_sha: string;
+  source_sha256: string;
+  architecture_profile: Record<string, any>;
+  check_plan: string[];
+  sbom_ref?: string | null;
+  coverage: Record<string, CoverageStatus>;
+  dep_graph_summary: Record<string, any>;
+  findings: Record<string, Finding>;
+  policy_verdicts: Record<string, "PASS" | "BLOCK">;
+  remediations: Record<string, Remediation>;
+  approvals: Record<string, unknown>;
+  gate_results: GateResult[];
+  final_report?: {
+    markdown_sha256?: string;
+    sarif_sha256?: string;
+    vex_sha256?: string;
+    pr_url?: string;
+  };
+  audit_chain_head: string;
+}
+
+export interface GraphNode {
+  id: string;
+  kind: "application" | "module" | "library";
+  label?: string;
+  name?: string;
+  version?: string;
+  ecosystem?: string;
+  scope?: string;
+  sources?: string[];
+  single_source?: boolean;
+  resolved?: boolean;
+  direct?: boolean;
+  depth?: number | null;
+  path?: string[];
+}
+
+export interface GraphLink {
+  source: string;
+  target: string;
+  relationship: "module" | "depends_on" | "unresolved";
+  scope?: string;
+}
+
+export interface DepGraph {
+  nodes: GraphNode[];
+  links: GraphLink[];
+  graph?: { root?: string; metrics?: Record<string, any>; sbom_sha256?: string };
+}
+
+export interface RunGraph {
+  run_id: string;
+  dep_graph: DepGraph;
+  coverage: Record<string, CoverageStatus>;
+  sbom_ref?: string | null;
+}
+
+export interface Neo4jInfo {
+  enabled: boolean;
+  export: { exported?: boolean; reason?: string; components?: number; edges?: number };
+  browser_url: string;
+  queries: { title: string; cypher: string; url: string }[];
+}
+
+export interface RunSummary {
+  run_id: string;
+  status: RunStatus;
+  repo_url: string;
+  commit_sha: string;
+  findings_count: number;
+}
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(`${ORCHESTRATOR_URL}${path}`, {
+    ...init,
+    headers: { "Content-Type": "application/json", ...(init?.headers || {}) },
+    cache: "no-store",
+  });
+  if (!res.ok) {
+    let detail = res.statusText;
+    try {
+      detail = (await res.json()).detail ?? detail;
+    } catch {
+      /* not JSON */
+    }
+    throw new Error(`${res.status} ${detail}`);
+  }
+  return res.json() as Promise<T>;
+}
+
+export const fetchRuns = () => request<RunSummary[]>("/runs").catch(() => [] as RunSummary[]);
+
+export const fetchRun = (runId: string) => request<RunData>(`/runs/${encodeURIComponent(runId)}`);
+
+export const fetchGraph = (runId: string) => request<RunGraph>(`/runs/${encodeURIComponent(runId)}/graph`);
+
+export const fetchNeo4j = (runId: string) => request<Neo4jInfo>(`/runs/${encodeURIComponent(runId)}/neo4j`);
+
+export const sbomDownloadUrl = (runId: string) => `${ORCHESTRATOR_URL}/runs/${encodeURIComponent(runId)}/sbom`;
+
+export const createRun = (repoUrl: string, commitSha: string = "HEAD") =>
+  request<{ run_id: string; status: RunStatus }>("/runs", {
+    method: "POST",
+    body: JSON.stringify({ repo_url: repoUrl, commit_sha: commitSha || "HEAD" }),
+  });
+
+export const approvePatch = (runId: string, findingId: string, patchSha256: string, userId = "dashboard-user") =>
+  request(`/runs/${encodeURIComponent(runId)}/approve`, {
+    method: "POST",
+    body: JSON.stringify({ finding_id: findingId, decision: "APPROVED", user_id: userId, patch_sha256: patchSha256 }),
+  });
+
+export const isTerminal = (status?: RunStatus) => status === "completed" || status === "stopped" || status === "error";

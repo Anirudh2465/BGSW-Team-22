@@ -311,3 +311,88 @@ def test_service_error_becomes_failed_gate(fake, monkeypatch):
     gate = data["gate_results"][-1]
     assert gate["gate"] == "manifest_profile_gate" and gate["passed"] is False
     assert "unreachable" in gate["error"]
+
+
+# ------------------------------------------------------------------------------
+# Neo4j export (optional visualisation)
+# ------------------------------------------------------------------------------
+from app.db import neo4j_store
+from app.db.neo4j_store import Neo4jExporter, build_rows
+
+SAMPLE_GRAPH = {
+    "nodes": [
+        {"id": "app", "kind": "application"},
+        {"id": "pkg:maven/com.example/app@1.0.0", "kind": "module", "name": "app", "version": "1.0.0",
+         "ecosystem": "maven", "sources": ["resolved:maven"], "depth": 1},
+        {"id": "pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1", "kind": "library", "name": "log4j-core",
+         "version": "2.14.1", "ecosystem": "maven", "sources": ["resolved:maven", "syft"], "depth": 2, "direct": True,
+         "resolved": True},
+        {"id": "pkg:golang/github.com/gin-gonic/gin@v1.9.1", "kind": "library", "name": "gin", "version": "v1.9.1",
+         "ecosystem": "golang", "sources": ["syft"], "single_source": True, "depth": 1},
+    ],
+    "links": [
+        {"source": "app", "target": "pkg:maven/com.example/app@1.0.0", "relationship": "module"},
+        {"source": "pkg:maven/com.example/app@1.0.0", "target": "pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1",
+         "relationship": "depends_on", "scope": "compile"},
+        {"source": "app", "target": "pkg:golang/github.com/gin-gonic/gin@v1.9.1", "relationship": "unresolved"},
+    ],
+}
+
+
+def test_neo4j_rows_from_dep_graph():
+    rows = build_rows(SAMPLE_GRAPH)
+    assert [c["purl"] for c in rows["components"] if c["module"]] == ["pkg:maven/com.example/app@1.0.0"]
+    assert rows["modules"] == [{"purl": "pkg:maven/com.example/app@1.0.0"}]
+    assert rows["depends"] == [{"source": "pkg:maven/com.example/app@1.0.0",
+                                "target": "pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1", "scope": "compile"}]
+    assert rows["observed"] == [{"purl": "pkg:golang/github.com/gin-gonic/gin@v1.9.1"}]
+    gin = next(i for i in rows["includes"] if "gin" in i["purl"])
+    assert gin["single_source"] is True and gin["resolved"] is False
+    assert all(c["purl"] != "app" for c in rows["components"])
+
+
+def test_neo4j_export_disabled_without_uri():
+    assert Neo4jExporter("", "neo4j", "x").export_run("r", "u", "c", "s", SAMPLE_GRAPH)["exported"] is False
+
+
+def test_neo4j_export_writes_run_scoped_graph():
+    queries = []
+
+    class Tx:
+        def run(self, cypher, **params):
+            queries.append((cypher, params))
+
+    class Session:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def run(self, cypher, **params): queries.append((cypher, params))
+        def execute_write(self, fn, *args): return fn(Tx(), *args)
+
+    class Driver:
+        def session(self): return Session()
+
+    exporter = Neo4jExporter("bolt://neo4j:7687", "neo4j", "pw")
+    exporter._driver = Driver()
+    result = exporter.export_run("run-1", "https://github.com/x/y", "abc", "sha", SAMPLE_GRAPH)
+    assert result == {"exported": True, "components": 3, "edges": 1}
+    cyphers = " ".join(q for q, _ in queries)
+    assert "DETACH DELETE r" in cyphers and "DEPENDS_ON {run_id: $run_id" in cyphers and "OBSERVED" in cyphers
+    assert all(p.get("run_id") == "run-1" for q, p in queries if "run_id" in p)
+
+
+def test_neo4j_export_failure_never_fails_scan():
+    class Broken:
+        def session(self): raise ConnectionError("neo4j down")
+
+    exporter = Neo4jExporter("bolt://neo4j:7687", "neo4j", "pw")
+    exporter._driver = Broken()
+    res = exporter.export_run("run-1", "u", "c", "s", SAMPLE_GRAPH)
+    assert res["exported"] is False and "neo4j down" in res["reason"]
+
+
+def test_neo4j_endpoint_gives_browser_links():
+    run_id = client.post("/runs", json={"repo_url": "https://github.com/example/log4shell"}).json()["run_id"]
+    data = client.get(f"/runs/{run_id}/neo4j").json()
+    assert data["enabled"] is False and data["export"]["exported"] is False
+    assert data["queries"][0]["url"].startswith("http://localhost:7474/browser/?cmd=edit&arg=")
+    assert run_id in data["queries"][0]["cypher"]

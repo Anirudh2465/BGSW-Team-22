@@ -1,0 +1,9 @@
+# Keep local build output and caches out of every image build context
+**/node_modules
+**/.next
+**/__pycache__
+**/.pytest_cache
+**/*.pyc
+.git
+.env
+secrets/

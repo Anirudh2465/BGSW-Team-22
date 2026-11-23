@@ -19,6 +19,11 @@ class OrchestratorConfig:
         "verify": float(os.getenv("STAGE4_HTTP_TIMEOUT_S", "1500")),
     }
     ANALYSIS_TIMEOUT_S: float = float(os.getenv("ANALYSIS_HTTP_TIMEOUT_S", "300"))
+    # Optional Neo4j graph export (docker compose --profile neo4j); empty URI disables it
+    NEO4J_URI: str = os.getenv("NEO4J_URI", "")
+    NEO4J_USER: str = os.getenv("NEO4J_USER", "neo4j")
+    NEO4J_PASSWORD: str = os.getenv("NEO4J_PASSWORD", "")
+    NEO4J_BROWSER_URL: str = os.getenv("NEO4J_BROWSER_URL", "http://localhost:7474")
     AUDIT_ED25519_PRIVATE_KEY_HEX: str = os.getenv(
         "AUDIT_ED25519_PRIVATE_KEY_HEX",
         "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"

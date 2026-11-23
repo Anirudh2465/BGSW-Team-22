@@ -33,6 +33,7 @@ from ..config import config
 from ..db.artifacts import artifact_store
 from ..db.audit_chain import audit_chain
 from ..db.graph_store import persist_edges
+from ..db import neo4j_store
 
 logger = logging.getLogger("orchestrator.graph.nodes")
 
@@ -217,10 +218,14 @@ def discover_node(state: GuardianState) -> Dict[str, Any]:
         "action": None if resp.gate_passed else ("marked_skipped" if final_attempt else "retry_resolve"),
     }
     stored_edges = persist_edges(run_id, resp.dep_graph, config.POSTGRES_URL, artifact_store.backend == "postgres")
+    neo4j_result = neo4j_store.neo4j_exporter.export_run(
+        run_id, state["repo_url"], state.get("commit_sha", ""), resp.sbom_artifact_sha256, resp.dep_graph,
+    ) if resp.dep_graph.get("nodes") else {"exported": False, "reason": "empty graph"}
     delta = _record(state, "discover_node", gate, {
         "stage": "discover",
         "artifacts": {"sbom": resp.sbom_artifact_sha256} if resp.sbom_artifact_sha256 else {},
         "edges_persisted": stored_edges,
+        "neo4j": neo4j_result,
     })
     delta.update({"sbom_ref": resp.sbom_artifact_sha256 or None, "dep_graph": resp.dep_graph, "coverage": resp.coverage})
     return delta

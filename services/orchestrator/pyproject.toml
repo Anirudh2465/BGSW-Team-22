@@ -16,6 +16,7 @@ dependencies = [
     "apscheduler>=3.10.4",
     "langgraph>=0.2.60",
     "psycopg[binary]>=3.1.18",
+    "neo4j>=5.20.0",
     "guardian-contracts",
 ]
 

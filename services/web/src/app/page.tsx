@@ -4,7 +4,7 @@ import React, { useState, useEffect } from "react";
 import { fetchRuns, createRun } from "../lib/api";
 
 export default function HomePage() {
-  const [repoUrl, setRepoUrl] = useState("https://github.com/example/sample-vulnerable-log4j");
+  const [repoUrl, setRepoUrl] = useState("https://github.com/spring-projects/spring-petclinic");
   const [commitSha, setCommitSha] = useState("HEAD");
   const [loading, setLoading] = useState(false);
   const [runs, setRuns] = useState<any[]>([]);

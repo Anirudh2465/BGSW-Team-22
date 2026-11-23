@@ -18,6 +18,7 @@ from guardian_contracts.state import GuardianState, Approval
 from .config import config
 from .db.artifacts import artifact_store
 from .db.audit_chain import audit_chain
+from .db import neo4j_store
 from .graph.builder import graph_runner
 
 app = FastAPI(title="Supply Chain Guardian - Orchestrator Gateway", version="0.2.0")
@@ -129,6 +130,7 @@ def health():
         "status": "healthy",
         "service": "orchestrator",
         "artifact_backend": artifact_store.backend,
+        "neo4j_enabled": neo4j_store.neo4j_exporter.enabled,
         "audit_chain_head": audit_chain.get_chain_head(),
     }
 
@@ -184,6 +186,27 @@ def get_run_graph(run_id: str):
     state = RUNS_DB[run_id]
     return {"run_id": run_id, "dep_graph": state.get("dep_graph") or {}, "coverage": state.get("coverage", {}),
             "sbom_ref": state.get("sbom_ref")}
+
+
+@app.get("/runs/{run_id}/neo4j")
+def get_run_neo4j(run_id: str):
+    """Neo4j Browser links with ready-to-run Cypher for this run's graph."""
+    if run_id not in RUNS_DB:
+        raise HTTPException(status_code=404, detail="Run not found")
+    export = {}
+    for entry in reversed(RUNS_DB[run_id].get("audit_log", [])):
+        if entry.get("stage") == "discover":
+            export = entry.get("neo4j", {})
+            break
+    return {
+        "enabled": neo4j_store.neo4j_exporter.enabled,
+        "export": export,
+        "browser_url": config.NEO4J_BROWSER_URL,
+        "queries": [
+            {**q, "url": neo4j_store.browser_link(config.NEO4J_BROWSER_URL, q["cypher"])}
+            for q in neo4j_store.suggested_queries(run_id)
+        ],
+    }
 
 
 @app.get("/runs/{run_id}/sbom")
