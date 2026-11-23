@@ -1,7 +1,8 @@
-.PHONY: help up up-no-ollama down test-all eval-golden verify-audit reset-db lint
+.PHONY: help sandbox-images up up-no-ollama down test-all eval-golden verify-audit reset-db lint
 
 help:
 	@echo "Supply Chain Guardian - Monorepo Commands"
+	@echo "  make sandbox-images Build the four allowlisted sandbox images (run once)"
 	@echo "  make up             Start all services (including Ollama)"
 	@echo "  make up-no-ollama   Start services without local Ollama (rule fallback)"
 	@echo "  make down           Stop and tear down all containers"
@@ -10,6 +11,11 @@ help:
 	@echo "  make verify-audit   Verify Ed25519 hash chain for RUN_ID (pass RUN_ID=...)"
 	@echo "  make reset-db       Re-initialize database tables and purge test runs"
 	@echo "  make lint           Check python code formatting and static types"
+
+SANDBOX_IMAGE_VERSION ?= 0.1.0
+
+sandbox-images:
+	for stage in clone resolve scan verify; do 		docker build -t guardian-sandbox-$$stage:$(SANDBOX_IMAGE_VERSION) 			-f services/launcher/sandbox-images/$$stage.Dockerfile services/launcher/sandbox-images || exit 1; 	done
 
 up:
 	docker compose --profile ollama up --build -d

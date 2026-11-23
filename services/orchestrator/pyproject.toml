@@ -14,6 +14,8 @@ dependencies = [
     "httpx>=0.27.0",
     "cryptography>=42.0.0",
     "apscheduler>=3.10.4",
+    "langgraph>=0.2.60",
+    "psycopg[binary]>=3.1.18",
     "guardian-contracts",
 ]
 

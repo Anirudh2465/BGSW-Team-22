@@ -1,3 +1,4 @@
+import hashlib
 import os
 import httpx
 from typing import Dict, Any, Optional
@@ -24,6 +25,34 @@ from guardian_contracts.api_schemas import (
 from guardian_contracts.state import Finding, Evidence, Remediation
 from .config import config
 
+class ServiceError(RuntimeError):
+    """A downstream service failed; the calling node records a failed gate."""
+
+
+MOCK_SHA = {stage: hashlib.sha256(f"mock-{stage}".encode()).hexdigest()
+            for stage in ("clone", "resolve", "resolve-logs", "scan", "sbom", "verify")}
+
+MOCK_DEP_GRAPH = {
+    "directed": True, "multigraph": False,
+    "graph": {"root": "app", "metrics": {"components": 2, "mock": True}},
+    "nodes": [
+        {"id": "app", "kind": "application", "label": "application", "depth": 0},
+        {"id": "pkg:maven/com.example/app@1.0.0", "kind": "module", "label": "app@1.0.0", "depth": 1},
+        {"id": "pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1", "kind": "library",
+         "label": "log4j-core@2.14.1", "depth": 2, "direct": True, "ecosystem": "maven"},
+        {"id": "pkg:maven/org.apache.logging.log4j/log4j-api@2.14.1", "kind": "library",
+         "label": "log4j-api@2.14.1", "depth": 3, "direct": False, "ecosystem": "maven"},
+    ],
+    "links": [
+        {"source": "app", "target": "pkg:maven/com.example/app@1.0.0", "relationship": "module"},
+        {"source": "pkg:maven/com.example/app@1.0.0", "target": "pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1",
+         "relationship": "depends_on", "scope": "compile"},
+        {"source": "pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1",
+         "target": "pkg:maven/org.apache.logging.log4j/log4j-api@2.14.1", "relationship": "depends_on", "scope": "compile"},
+    ],
+}
+
+
 class ServiceClients:
     """Typed HTTP client layer for communicating across microservices."""
 
@@ -33,73 +62,87 @@ class ServiceClients:
         self.remediation_url = config.REMEDIATION_ENGINE_URL
         self.mock_mode = os.getenv("MOCK_SERVICES", "false").lower() in ("true", "1")
 
+    def _headers(self) -> Dict[str, str]:
+        return {"X-Guardian-Token": config.INTERNAL_API_TOKEN} if config.INTERNAL_API_TOKEN else {}
+
+    def _post(self, url: str, payload: Dict[str, Any], timeout: float) -> Dict[str, Any]:
+        try:
+            with httpx.Client(timeout=timeout) as client:
+                res = client.post(url, json=payload, headers=self._headers())
+        except httpx.HTTPError as exc:
+            raise ServiceError(f"{url} unreachable: {exc}") from exc
+        if res.status_code != 200:
+            raise ServiceError(f"{url} returned HTTP {res.status_code}: {res.text[:300]}")
+        return res.json()
+
+    # ------------------------------------------------------------ launcher
     def run_launcher_stage(self, req: StageRunRequest) -> StageRunResponse:
         if self.mock_mode:
+            details: Dict[str, Any] = {"hook_anomalies": False, "mock": True}
+            if req.stage == "clone":
+                details["commit_sha"] = "c0ffee1234567890abcdef1234567890abcdef12"
             return StageRunResponse(
                 run_id=req.run_id,
                 stage=req.stage,
                 status="success",
-                artifact_sha256=f"mock-{req.stage}-sha256",
+                artifact_sha256=MOCK_SHA.get(req.stage),
+                logs_artifact_sha256=MOCK_SHA["resolve-logs"] if req.stage == "resolve" else None,
                 metrics={"mock": True},
-                details={"hook_anomalies": False}
+                details=details,
             )
-        try:
-            with httpx.Client(timeout=1.0) as client:
-                res = client.post(f"{self.launcher_url}/stages/run", json=req.model_dump())
-                return StageRunResponse(**res.json())
-        except Exception:
-            return StageRunResponse(
-                run_id=req.run_id,
-                stage=req.stage,
-                status="success",
-                artifact_sha256=f"mock-{req.stage}-sha256",
-                metrics={"mock": True},
-                details={"hook_anomalies": False}
-            )
+        timeout = config.STAGE_TIMEOUTS.get(req.stage, 600)
+        return StageRunResponse(**self._post(f"{self.launcher_url}/stages/run", req.model_dump(), timeout))
 
+    def fetch_launcher_artifact(self, sha256: str) -> bytes:
+        try:
+            res = httpx.get(f"{self.launcher_url}/artifacts/{sha256}", headers=self._headers(), timeout=120)
+        except httpx.HTTPError as exc:
+            raise ServiceError(f"launcher artifact {sha256[:12]} unreachable: {exc}") from exc
+        if res.status_code != 200:
+            raise ServiceError(f"launcher artifact {sha256[:12]} missing (HTTP {res.status_code})")
+        if hashlib.sha256(res.content).hexdigest() != sha256:
+            raise ServiceError(f"launcher artifact {sha256[:12]} failed hash verification")
+        return res.content
+
+    def ensure_launcher_artifact(self, sha256: str, content: Optional[bytes]) -> None:
+        """Make sure the launcher holds an artifact (e.g. after a launcher restart)."""
+        try:
+            head = httpx.head(f"{self.launcher_url}/artifacts/{sha256}", headers=self._headers(), timeout=30)
+            if head.status_code == 200:
+                return
+            if content is None:
+                raise ServiceError(f"artifact {sha256[:12]} is in neither the launcher nor the store")
+            res = httpx.put(f"{self.launcher_url}/artifacts/{sha256}", content=content,
+                            headers=self._headers(), timeout=120)
+        except httpx.HTTPError as exc:
+            raise ServiceError(f"launcher artifact sync failed: {exc}") from exc
+        if res.status_code != 200:
+            raise ServiceError(f"launcher rejected artifact {sha256[:12]}: HTTP {res.status_code}")
+
+    # -------------------------------------------------------- scanner-intel
     def call_cartographer(self, req: CartographerRequest) -> CartographerResponse:
         if self.mock_mode:
             return CartographerResponse(
                 run_id=req.run_id,
-                architecture_profile={"ecosystems": ["maven"]},
-                check_plan=["cve_scan", "maven_dependency_tree"],
+                architecture_profile={"ecosystems": ["maven"], "mock": True},
+                check_plan=["sbom_consensus", "cve_scan", "maven_dependency_tree"],
                 gate_passed=True,
-                clone_integrity_details={"valid_hash": True}
+                clone_integrity_details={"valid_hash": True, "passed": True},
             )
-        try:
-            with httpx.Client(timeout=1.0) as client:
-                res = client.post(f"{self.scanner_url}/cartographer", json=req.model_dump())
-                return CartographerResponse(**res.json())
-        except Exception:
-            return CartographerResponse(
-                run_id=req.run_id,
-                architecture_profile={"ecosystems": ["maven"]},
-                check_plan=["cve_scan"],
-                gate_passed=True,
-                clone_integrity_details={"valid_hash": True}
-            )
+        data = self._post(f"{self.scanner_url}/cartographer", req.model_dump(), config.ANALYSIS_TIMEOUT_S)
+        return CartographerResponse(**data)
 
     def call_discover(self, req: DiscoverRequest) -> DiscoverResponse:
         if self.mock_mode:
             return DiscoverResponse(
                 run_id=req.run_id,
-                sbom_artifact_sha256="mock-sbom-sha256",
-                dep_graph={"nodes": [], "links": []},
-                coverage={"pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1": "scanned"},
-                gate_passed=True
+                sbom_artifact_sha256=MOCK_SHA["sbom"],
+                dep_graph=MOCK_DEP_GRAPH,
+                coverage={"maven": "scanned"},
+                gate_passed=True,
             )
-        try:
-            with httpx.Client(timeout=1.0) as client:
-                res = client.post(f"{self.scanner_url}/discover", json=req.model_dump())
-                return DiscoverResponse(**res.json())
-        except Exception:
-            return DiscoverResponse(
-                run_id=req.run_id,
-                sbom_artifact_sha256="mock-sbom-sha256",
-                dep_graph={"nodes": [], "links": []},
-                coverage={"pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1": "scanned"},
-                gate_passed=True
-            )
+        data = self._post(f"{self.scanner_url}/discover", req.model_dump(), config.ANALYSIS_TIMEOUT_S)
+        return DiscoverResponse(**data)
 
     def call_detect(self, req: DetectRequest) -> DetectResponse:
         if self.mock_mode:

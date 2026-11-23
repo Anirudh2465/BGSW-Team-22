@@ -1,3 +1,4 @@
+import hashlib
 import sys
 from pathlib import Path
 
@@ -16,20 +17,37 @@ if str(SERVICE_DIR) not in sys.path:
 
 import pytest
 from fastapi.testclient import TestClient
+
+import app.main as main
 from app.main import app, RUNS_DB
-from app.clients import service_clients
+from app.clients import service_clients, MOCK_DEP_GRAPH
 from app.db.audit_chain import AuditChainManager
-from app.db.artifacts import ArtifactStore
+from app.db.artifacts import ArtifactStore, artifact_store
+from app.graph import nodes
+from guardian_contracts.api_schemas import CartographerResponse, DiscoverResponse, StageRunResponse
 from guardian_contracts.state import Remediation
 
+main.RUN_SYNC = True
 service_clients.mock_mode = True
 
 client = TestClient(app)
+
+COMMIT = "c0ffee1234567890abcdef1234567890abcdef12"
+
+
+def sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def gates(run_data):
+    return [g["gate"] for g in run_data["gate_results"]]
+
 
 def test_health():
     res = client.get("/health")
     assert res.status_code == 200
     assert res.json()["status"] == "healthy"
+
 
 def test_audit_chain_integrity_and_ed25519():
     manager = AuditChainManager()
@@ -46,12 +64,16 @@ def test_audit_chain_integrity_and_ed25519():
     assert valid_tampered is False
     assert len(errors_tampered) > 0
 
+
 def test_artifact_store_content_addressed():
     store = ArtifactStore()
     content = b"sample artifact data"
-    sha = store.put("run-1", "clone", "text/plain", content)
-    assert len(sha) == 64
-    assert store.get(sha) == content
+    digest = store.put("run-1", "clone", "text/plain", content)
+    assert len(digest) == 64
+    assert store.get(digest) == content
+    with pytest.raises(ValueError):
+        store.put_verified("0" * 64, "run-1", "clone", "text/plain", content)
+
 
 def test_pipeline_execution_and_approval():
     res = client.post("/runs", json={"repo_url": "https://github.com/example/sample-vulnerable-log4j"})
@@ -62,7 +84,19 @@ def test_pipeline_execution_and_approval():
     run_res = client.get(f"/runs/{run_id}")
     assert run_res.status_code == 200
     run_data = run_res.json()
+    assert run_data["status"] == "completed"
     assert len(run_data["gate_results"]) == 9
+    assert gates(run_data)[:4] == ["clone_integrity_gate", "manifest_profile_gate", "hook_observation_gate",
+                                   "coverage_gate"]
+    assert run_data["commit_sha"] == COMMIT  # HEAD pinned to the scanned commit
+
+    graph = client.get(f"/runs/{run_id}/graph").json()
+    assert graph["dep_graph"]["nodes"] == MOCK_DEP_GRAPH["nodes"]
+    assert graph["coverage"] == {"maven": "scanned"}
+
+    events = client.get(f"/runs/{run_id}/events").json()
+    assert events[-1]["payload"]["status"] == "completed"
+    assert any(e["event_type"] == "gate_result" and e["payload"]["gate_name"] == "coverage_gate" for e in events)
 
     RUNS_DB[run_id]["remediations"]["f-1"] = Remediation(
         finding_id="f-1",
@@ -96,3 +130,184 @@ def test_pipeline_execution_and_approval():
     })
     assert bad_res.status_code == 400
     assert "not been verified" in bad_res.json()["detail"]
+
+
+# ------------------------------------------------------------------------------
+# Non-mock front half: a stateful fake of launcher + scanner-intel behind the
+# real client methods, so routing, artifact brokering and gates are exercised.
+# ------------------------------------------------------------------------------
+class FakeServices:
+    def __init__(self, clone_ok=True, cartographer_ok=True, coverage_results=(True,)):
+        self.launcher = {}
+        self.calls = []
+        self.clone_ok = clone_ok
+        self.cartographer_ok = cartographer_ok
+        self.coverage_results = list(coverage_results)
+
+    def blob(self, label: str) -> str:
+        data = f"{label}-{len(self.launcher)}".encode()
+        digest = sha(data)
+        self.launcher[digest] = data
+        return digest
+
+    def run_launcher_stage(self, req):
+        self.calls.append(("stage", req.stage, dict(req.parameters)))
+        if req.stage == "clone":
+            if not self.clone_ok:
+                return StageRunResponse(run_id=req.run_id, stage="clone", status="failure",
+                                        details={"error": "clone integrity caps violated", "tree_clean": False})
+            return StageRunResponse(run_id=req.run_id, stage="clone", status="success",
+                                    artifact_sha256=self.blob("source"),
+                                    details={"commit_sha": COMMIT, "tree_clean": True})
+        if req.stage == "resolve":
+            return StageRunResponse(run_id=req.run_id, stage="resolve", status="success",
+                                    artifact_sha256=self.blob("tree"), logs_artifact_sha256=self.blob("sinkhole"),
+                                    details={"hook_anomalies": False})
+        if req.stage == "scan":
+            assert req.parameters["network_mode"] == "none"
+            return StageRunResponse(run_id=req.run_id, stage="scan", status="success",
+                                    artifact_sha256=self.blob("bundle"), details={"network_isolated": True})
+        raise AssertionError(req.stage)
+
+    def fetch_launcher_artifact(self, digest):
+        return self.launcher[digest]
+
+    def ensure_launcher_artifact(self, digest, content):
+        self.calls.append(("ensure", digest))
+        assert digest in self.launcher or content is not None
+
+    def call_cartographer(self, req):
+        self.calls.append(("cartographer", req.source_artifact_sha256))
+        return CartographerResponse(run_id=req.run_id, architecture_profile={"ecosystems": ["maven", "npm"]},
+                                    check_plan=["cve_scan", "install_hook_observation"] if self.cartographer_ok else [],
+                                    gate_passed=self.cartographer_ok, clone_integrity_details={"passed": self.cartographer_ok})
+
+    def call_discover(self, req):
+        self.calls.append(("discover", req.tree_artifact_sha256))
+        ok = self.coverage_results.pop(0) if self.coverage_results else True
+        return DiscoverResponse(run_id=req.run_id, sbom_artifact_sha256=sha(b"sbom"), dep_graph=MOCK_DEP_GRAPH,
+                                coverage={"maven": "scanned", "npm": "scanned" if ok else "skipped"}, gate_passed=ok)
+
+
+@pytest.fixture
+def fake(monkeypatch):
+    def install(**kwargs):
+        services = FakeServices(**kwargs)
+        monkeypatch.setattr(service_clients, "mock_mode", False)
+        for name in ("run_launcher_stage", "fetch_launcher_artifact", "ensure_launcher_artifact",
+                     "call_cartographer", "call_discover"):
+            monkeypatch.setattr(service_clients, name, getattr(services, name))
+        # Back half (detect onwards) is out of scope here: use its built-in mock responses.
+        for name in ("call_detect", "call_prioritize", "call_policy", "call_remediate", "call_verify", "call_report"):
+            monkeypatch.setattr(service_clients, name, _mocked(getattr(service_clients, name)))
+        return services
+    return install
+
+
+def _mocked(fn):
+    def inner(req):
+        service_clients.mock_mode = True
+        try:
+            return fn(req)
+        finally:
+            service_clients.mock_mode = False
+    return inner
+
+
+def _start():
+    run_id = client.post("/runs", json={"repo_url": "https://github.com/example/log4shell"}).json()["run_id"]
+    return run_id, client.get(f"/runs/{run_id}").json()
+
+
+def test_front_half_brokers_artifacts_and_feeds_bundle_to_discover(fake):
+    services = fake()
+    run_id, data = _start()
+    assert data["status"] == "completed"
+
+    stages = [c[1] for c in services.calls if c[0] == "stage"]
+    assert stages == ["clone", "resolve", "scan"]
+    resolve_params = next(c[2] for c in services.calls if c[0] == "stage" and c[1] == "resolve")
+    assert resolve_params["observe_hooks"] is True  # from the check plan
+
+    state = RUNS_DB[run_id]
+    tree = nodes.stage_artifacts(state, "resolve")["tree"]
+    bundle = nodes.stage_artifacts(state, "scan")["bundle"]
+    scan_params = next(c[2] for c in services.calls if c[0] == "stage" and c[1] == "scan")
+    assert scan_params["tree_artifact_sha256"] == tree
+    assert ("discover", bundle) in services.calls
+
+    # Every launcher output is now in the orchestrator store, verified by hash
+    for digest in (state["source_sha256"], tree, bundle, nodes.stage_artifacts(state, "resolve")["sinkhole_logs"]):
+        assert artifact_store.get(digest) == services.launcher[digest]
+    # State carries hashes only (Invariant 6)
+    assert len(state["source_sha256"]) == 64 and "/" not in state["source_sha256"]
+
+
+def test_internal_artifact_api_serves_scanner_intel(fake):
+    fake()
+    run_id, data = _start()
+    digest = data["source_sha256"]
+    res = client.get(f"/internal/artifacts/{digest}")
+    assert res.status_code == 200 and sha(res.content) == digest
+    put = client.put(f"/internal/artifacts/{sha(b'sbom-bytes')}", content=b"sbom-bytes",
+                     params={"run_id": run_id, "stage": "discover"})
+    assert put.status_code == 200
+    bad = client.put(f"/internal/artifacts/{'0' * 64}", content=b"x", params={"run_id": run_id, "stage": "discover"})
+    assert bad.status_code == 400
+
+
+def test_internal_artifact_api_requires_token(monkeypatch):
+    monkeypatch.setattr(main.config, "INTERNAL_API_TOKEN", "s3cret")
+    assert client.get(f"/internal/artifacts/{'a' * 64}").status_code == 401
+    assert client.get(f"/internal/artifacts/{'a' * 64}", headers={"X-Guardian-Token": "s3cret"}).status_code == 404
+
+
+def test_clone_integrity_failure_stops_the_run(fake):
+    services = fake(clone_ok=False)
+    run_id, data = _start()
+    assert data["status"] == "stopped"
+    assert gates(data) == ["clone_integrity_gate"]
+    assert data["gate_results"][0]["passed"] is False
+    assert [c for c in services.calls if c[0] != "stage"] == []  # nothing ran after the failed gate
+
+
+def test_cartographer_gate_failure_stops_before_resolve(fake):
+    services = fake(cartographer_ok=False)
+    run_id, data = _start()
+    assert data["status"] == "stopped"
+    assert gates(data) == ["clone_integrity_gate", "manifest_profile_gate"]
+    assert [c[1] for c in services.calls if c[0] == "stage"] == ["clone"]
+
+
+def test_coverage_gate_retries_resolve_once_then_continues(fake):
+    services = fake(coverage_results=(False, False))
+    run_id, data = _start()
+    coverage_gates = [g for g in data["gate_results"] if g["gate"] == "coverage_gate"]
+    assert [g["attempt"] for g in coverage_gates] == [1, 2]
+    assert coverage_gates[0]["action"] == "retry_resolve"
+    assert coverage_gates[1]["action"] == "marked_skipped"
+    assert [c[1] for c in services.calls if c[0] == "stage"] == ["clone", "resolve", "scan", "resolve", "scan"]
+    assert "cross_check_gate" in gates(data)  # pipeline continued with npm marked skipped
+    assert data["coverage"]["npm"] == "skipped"
+
+
+def test_coverage_retry_succeeds(fake):
+    fake(coverage_results=(False, True))
+    run_id, data = _start()
+    assert [g["passed"] for g in data["gate_results"] if g["gate"] == "coverage_gate"] == [False, True]
+    assert data["status"] == "completed"
+
+
+def test_service_error_becomes_failed_gate(fake, monkeypatch):
+    services = fake()
+
+    def boom(req):
+        from app.clients import ServiceError
+        raise ServiceError("scanner-intel unreachable")
+
+    monkeypatch.setattr(service_clients, "call_cartographer", boom)
+    run_id, data = _start()
+    assert data["status"] == "stopped"
+    gate = data["gate_results"][-1]
+    assert gate["gate"] == "manifest_profile_gate" and gate["passed"] is False
+    assert "unreachable" in gate["error"]

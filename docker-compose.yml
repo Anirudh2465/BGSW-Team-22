@@ -31,14 +31,21 @@ services:
       - SANDBOX_RUNTIME=${SANDBOX_RUNTIME:-runsc}
       - LAUNCHER_HOST=0.0.0.0
       - LAUNCHER_PORT=8001
-      - ALLOWLIST_PROXY_PORT=8080
-      - SINKHOLE_PORT=8081
+      # Sandboxes join a fresh internal network per stage; the launcher attaches to it
+      # under the alias guardian-egress so sandboxes can reach only its per-run proxy.
+      - LAUNCHER_CONTAINER_NAME=guardian-launcher
+      - LAUNCHER_ARTIFACT_DIR=/var/lib/guardian/artifacts
+      - INTERNAL_API_TOKEN=${INTERNAL_API_TOKEN:-}
+      - SANDBOX_IMAGE_DIGEST_CLONE=${SANDBOX_IMAGE_DIGEST_CLONE:-}
+      - SANDBOX_IMAGE_DIGEST_RESOLVE=${SANDBOX_IMAGE_DIGEST_RESOLVE:-}
+      - SANDBOX_IMAGE_DIGEST_SCAN=${SANDBOX_IMAGE_DIGEST_SCAN:-}
+      - SANDBOX_IMAGE_DIGEST_VERIFY=${SANDBOX_IMAGE_DIGEST_VERIFY:-}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      - launcher_artifacts:/var/lib/guardian/artifacts
     networks:
-      - launcher
-    ports:
-      - "8001:8001"
+      - launcher   # orchestrator only (internal)
+      - egress     # upstream for the allowlist proxy; no inbound ports are published
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
       interval: 10s
@@ -63,6 +70,9 @@ services:
       - REMEDIATION_ENGINE_URL=http://remediation-engine:8003
       - AUDIT_ED25519_PRIVATE_KEY_HEX=${AUDIT_ED25519_PRIVATE_KEY_HEX:-}
       - RECURSION_LIMIT=60
+      - ARTIFACT_BACKEND=postgres
+      - INTERNAL_API_TOKEN=${INTERNAL_API_TOKEN:-}
+      - CORS_ORIGINS=http://localhost:3000
     networks:
       - core
       - launcher
@@ -83,6 +93,8 @@ services:
     environment:
       - ENABLE_OLLAMA=${ENABLE_OLLAMA:-false}
       - OLLAMA_URL=http://ollama:11434
+      - ORCHESTRATOR_URL=http://orchestrator:8000
+      - INTERNAL_API_TOKEN=${INTERNAL_API_TOKEN:-}
     networks:
       - core
     ports:
@@ -152,7 +164,10 @@ networks:
   launcher:
     driver: bridge
     internal: true
+  egress:
+    driver: bridge
 
 volumes:
   postgres_data:
   ollama_data:
+  launcher_artifacts:

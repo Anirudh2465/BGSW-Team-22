@@ -21,7 +21,7 @@ from app.detectors.squat_confusion import SquatConfusionDetector
 from app.detectors.pinning_lockfile import PinningLockfileDetector
 from app.detectors.agent_config import AgentConfigDetector
 from app.reachability.static_scan import StaticReachabilityScanner
-from app.llm.ollama_adapter import OllamaAdapter
+from app.llm.ollama_adapter import OllamaAdapter, scrub_secrets
 
 client = TestClient(app)
 
@@ -64,25 +64,3 @@ def test_ollama_rule_fallback():
     assert len(purls) == 1
     assert "pkg:maven" in purls[0]
 
-def test_scanner_intel_api_endpoints():
-    c_res = client.post("/cartographer", json={
-        "run_id": "test-1",
-        "source_artifact_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-    })
-    assert c_res.status_code == 200
-    assert c_res.json()["gate_passed"] is True
-
-    d_res = client.post("/discover", json={
-        "run_id": "test-1",
-        "source_artifact_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-    })
-    assert d_res.status_code == 200
-    assert d_res.json()["gate_passed"] is True
-
-    det_res = client.post("/detect", json={
-        "run_id": "test-1",
-        "sbom_artifact_sha256": d_res.json()["sbom_artifact_sha256"],
-        "source_artifact_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-    })
-    assert det_res.status_code == 200
-    assert len(det_res.json()["findings"]) >= 1

@@ -37,7 +37,8 @@ def cartographer(req: CartographerRequest):
 def discover(req: DiscoverRequest):
     return discover_agent.discover_dependencies(
         run_id=req.run_id,
-        source_sha256=req.source_artifact_sha256
+        source_sha256=req.source_artifact_sha256,
+        tree_sha256=req.tree_artifact_sha256,
     )
 
 @app.post("/detect", response_model=DetectResponse)
