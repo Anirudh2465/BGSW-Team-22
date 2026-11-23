@@ -1,87 +1,126 @@
 "use client";
 
-import React, { useState } from "react";
-import { Finding } from "../lib/api";
+import React from "react";
+import Link from "next/link";
+import { ChevronRight, FileCheck2, Waypoints } from "lucide-react";
+import type { Finding } from "../lib/api";
+import { Badge, CopyButton, Hash, ScorePill } from "./ui";
+import { parsePurl } from "../lib/utils";
 
-interface EvidenceDrawerProps {
-  findings: Record<string, Finding>;
+const REACH: Record<number, { label: string; hint: string }> = {
+  1: { label: "Tier 1 · reachable", hint: "Vulnerable code is called from the app" },
+  2: { label: "Tier 2 · imported", hint: "Package is imported but the vulnerable call was not proven" },
+  3: { label: "Tier 3 · present", hint: "Package is installed, no usage evidence" },
+};
+
+/** Grounded evidence for one finding: every claim links back to a tool output by artifact hash. */
+export function EvidenceDrawer({
+  runId,
+  finding,
+  verdict,
+  sourceSha256,
+  inGraph,
+}: {
+  runId: string;
+  finding: Finding;
+  verdict?: "PASS" | "BLOCK";
   sourceSha256: string;
+  inGraph: boolean;
+}) {
+  const p = parsePurl(finding.purl);
+  const reach = finding.reach_tier ? REACH[finding.reach_tier] : undefined;
+  return (
+    <div className="animate-fade-in">
+      <div className="flex items-start gap-3 px-5 pt-5">
+        <ScorePill score={finding.score} className="h-11 w-14 text-base" />
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <Badge tone="danger" className="uppercase">
+              {finding.kind}
+            </Badge>
+            <Badge tone={finding.status === "confirmed" ? "danger" : "warning"}>{finding.status}</Badge>
+            {verdict && <Badge tone={verdict === "BLOCK" ? "danger" : "success"}>policy {verdict}</Badge>}
+            {reach && (
+              <Badge tone="info" title={reach.hint}>
+                {reach.label}
+              </Badge>
+            )}
+          </div>
+          <h3 className="mt-1.5 break-words text-lg font-semibold leading-tight text-ink">
+            {p.name}
+            <span className="font-normal text-ink-muted">@{p.version}</span>
+          </h3>
+          <div className="mt-1 flex items-center gap-1">
+            <code className="truncate text-[11px] text-ink-muted">{finding.purl}</code>
+            <CopyButton text={finding.purl} />
+          </div>
+        </div>
+      </div>
+
+      {inGraph && (
+        <div className="px-5 pt-4">
+          <Link
+            href={`/runs/${runId}/graph?node=${encodeURIComponent(finding.purl)}`}
+            className="inline-flex h-8 items-center gap-1.5 rounded-lg bg-accent/15 px-3 text-xs font-medium text-accent-soft ring-1 ring-inset ring-accent/30 hover:bg-accent/25"
+          >
+            <Waypoints className="h-3.5 w-3.5" /> Show in dependency graph
+          </Link>
+        </div>
+      )}
+
+      <Section title="Why this score">
+        <p className="text-sm leading-relaxed text-ink-soft">{finding.explanation || "No explanation recorded."}</p>
+        <p className="mt-1 text-[11px] text-ink-muted">Computed by code from CVSS, EPSS, KEV and reachability. No model decides the score.</p>
+      </Section>
+
+      <Section title="How it entered the app">
+        <ol className="space-y-1">
+          {finding.path.map((id, i) => (
+            <li key={id} className="flex items-center gap-1 text-xs" style={{ paddingLeft: Math.min(i, 8) * 10 }}>
+              {i > 0 && <ChevronRight className="h-3 w-3 text-accent-soft" />}
+              <span className={i === finding.path.length - 1 ? "font-medium text-ink" : "text-ink-soft"}>{id === "app" ? "Application" : parsePurl(id).name}</span>
+              {id !== "app" && <span className="font-mono text-[10px] text-ink-muted">{parsePurl(id).version}</span>}
+            </li>
+          ))}
+        </ol>
+      </Section>
+
+      <Section title={`Grounded evidence · ${finding.evidence.length}`}>
+        <ul className="space-y-2">
+          {finding.evidence.map((ev) => (
+            <li key={ev.id} className="rounded-lg bg-white/[0.03] p-3 ring-1 ring-inset ring-white/5">
+              <div className="flex items-center gap-2">
+                <FileCheck2 className="h-3.5 w-3.5 text-emerald-400" />
+                <Badge tone="info" className="font-mono">
+                  {ev.tool}
+                </Badge>
+                <code className="truncate text-xs text-ink">{ev.id}</code>
+              </div>
+              <div className="mt-1.5 flex items-center gap-2 text-[11px] text-ink-muted">
+                artifact <Hash value={ev.artifact_sha256} n={20} />
+              </div>
+            </li>
+          ))}
+        </ul>
+      </Section>
+
+      <Section title="Source tree">
+        <div className="flex items-center gap-2 text-[11px] text-ink-muted">
+          sha256 <Hash value={sourceSha256} n={24} />
+        </div>
+        <div className="mt-1 flex items-center gap-2 text-[11px] text-ink-muted">
+          finding id <Hash value={finding.id} n={24} />
+        </div>
+      </Section>
+    </div>
+  );
 }
 
-export function EvidenceDrawer({ findings, sourceSha256 }: EvidenceDrawerProps) {
-  const [selectedFindingId, setSelectedFindingId] = useState<string | null>(
-    Object.keys(findings)[0] || null
-  );
-
-  const selectedFinding = selectedFindingId ? findings[selectedFindingId] : null;
-
+function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
-    <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-lg">
-      <h3 className="text-lg font-semibold text-white mb-4 flex items-center gap-2">
-        <span className="w-2.5 h-2.5 rounded-full bg-emerald-500"></span>
-        Grounded Evidence & Cryptographic Artifacts
-      </h3>
-
-      <div className="mb-4 p-3 bg-slate-950 rounded-lg border border-slate-800 text-xs font-mono text-slate-300">
-        <span className="text-slate-500">Source Tree SHA-256:</span>{" "}
-        <span className="text-emerald-400 select-all">{sourceSha256 || "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}</span>
-      </div>
-
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        {/* Finding List */}
-        <div className="space-y-2">
-          {Object.values(findings).map((f) => (
-            <div
-              key={f.id}
-              onClick={() => setSelectedFindingId(f.id)}
-              className={`p-3 rounded-lg border cursor-pointer transition ${
-                selectedFindingId === f.id
-                  ? "bg-blue-950/60 border-blue-500"
-                  : "bg-slate-950 border-slate-800 hover:border-slate-700"
-              }`}
-            >
-              <div className="flex justify-between items-center">
-                <span className="text-xs font-bold text-red-400 uppercase">{f.kind}</span>
-                <span className="text-xs font-mono bg-red-950 text-red-300 px-2 py-0.5 rounded">
-                  Score: {f.score || "N/A"}
-                </span>
-              </div>
-              <p className="text-sm font-mono text-slate-200 mt-1 truncate">{f.purl}</p>
-            </div>
-          ))}
-        </div>
-
-        {/* Evidence Detail */}
-        <div className="bg-slate-950 p-4 rounded-lg border border-slate-800 text-xs">
-          {selectedFinding ? (
-            <div className="space-y-3">
-              <div>
-                <span className="text-slate-500 block">Finding ID:</span>
-                <span className="font-mono text-slate-200">{selectedFinding.id}</span>
-              </div>
-              <div>
-                <span className="text-slate-500 block">Explanation (Evidence Grounded):</span>
-                <p className="text-slate-300 mt-1">{selectedFinding.explanation}</p>
-              </div>
-              <div>
-                <span className="text-slate-500 block mb-1">Grounded Tool Evidence:</span>
-                <div className="space-y-1">
-                  {selectedFinding.evidence?.map((ev, idx) => (
-                    <div key={idx} className="p-2 bg-slate-900 rounded border border-slate-800">
-                      <span className="text-blue-400 font-bold">[{ev.tool}]</span> {ev.id}
-                      <span className="block text-slate-500 font-mono mt-0.5 text-[10px]">
-                        artifact_sha256: {ev.artifact_sha256}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            </div>
-          ) : (
-            <div className="text-slate-500 text-center py-8">Select a finding to inspect evidence</div>
-          )}
-        </div>
-      </div>
+    <div className="mx-5 mt-5 border-t border-line pt-4 last:pb-5">
+      <h4 className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-ink-muted">{title}</h4>
+      {children}
     </div>
   );
 }

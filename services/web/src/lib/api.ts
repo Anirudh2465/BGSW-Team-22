@@ -124,6 +124,23 @@ export interface RunSummary {
   repo_url: string;
   commit_sha: string;
   findings_count: number;
+  final_report?: RunData["final_report"] | null;
+}
+
+export interface RunEventRecord {
+  event_type: string;
+  run_id: string;
+  timestamp?: string;
+  seq?: number;
+  payload: Record<string, any>;
+}
+
+export interface OrchestratorHealth {
+  status: string;
+  service: string;
+  artifact_backend?: string;
+  neo4j_enabled?: boolean;
+  audit_chain_head?: string;
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -152,7 +169,12 @@ export const fetchGraph = (runId: string) => request<RunGraph>(`/runs/${encodeUR
 
 export const fetchNeo4j = (runId: string) => request<Neo4jInfo>(`/runs/${encodeURIComponent(runId)}/neo4j`);
 
-export const sbomDownloadUrl = (runId: string) => `${ORCHESTRATOR_URL}/runs/${encodeURIComponent(runId)}/sbom`;
+export const fetchEvents = (runId: string, since = 0) =>
+  request<RunEventRecord[]>(`/runs/${encodeURIComponent(runId)}/events?since=${since}`);
+
+export const fetchHealth = () => request<OrchestratorHealth>("/health");
+
+export const sbomDownloadUrl =(runId: string) => `${ORCHESTRATOR_URL}/runs/${encodeURIComponent(runId)}/sbom`;
 
 export const createRun = (repoUrl: string, commitSha: string = "HEAD") =>
   request<{ run_id: string; status: RunStatus }>("/runs", {
