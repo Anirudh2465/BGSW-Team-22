@@ -83,10 +83,13 @@ def enrichment_artifact(sbom_sha: str, feeds: Dict[str, Any], vulns: List[Dict[s
         "advisories": {
             v["finding_id"]: {
                 "advisory_id": v["advisory_id"], "aliases": v["aliases"], "purl": v["component"]["purl"],
+                "name": v["component"]["name"], "version": v["component"]["version"],
                 "cvss_score": v["cvss"]["score"], "cvss_vector": v["cvss"]["vector"], "cvss_version": v["cvss"]["version"],
                 "cvss_source": v["cvss"]["source"],
                 "epss": v["epss"], "epss_status": v["epss_status"], "kev": v["kev"], "kev_status": v["kev_status"],
                 "reach_tier": v["reach_tier"], "score": v["score"], "risk_band": v["risk_band"],
+                "cwes": v.get("cwes", []), "weakness_category": v.get("weakness_category"), "fix": v.get("fix", {}),
+                "base_explanation": v.get("explanation"),
             }
             for v in vulns
         },
