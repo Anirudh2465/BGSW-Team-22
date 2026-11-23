@@ -7,15 +7,32 @@
 
 ## 1. Executive Summary & Policy Verdicts
 
-| Finding ID | PURL | Reach Tier | Score | Policy Verdict | Status |
-| :--- | :--- | :---: | :---: | :---: | :--- |
+| Finding ID | Kind | PURL | Reach Tier | Score | Policy Verdict | Status |
+| :--- | :--- | :--- | :---: | :---: | :---: | :--- |
 {% for f in findings %}
-| `{{ f.id[:12] }}` | `{{ f.purl }}` | Tier {{ f.reach_tier or 3 }} | **{{ f.score }}** | `{{ policy_verdicts.get(f.id, 'BLOCK') }}` | {{ f.status }} |
+| `{{ f.id[:12] }}` | `{{ f.kind }}` | `{{ f.purl }}` | Tier {{ f.reach_tier or 3 }} | **{{ f.score }}** | `{{ policy_verdicts.get(f.id, 'BLOCK') }}` | {{ f.status }} |
 {% endfor %}
 
 ---
 
-## 2. Verified Remediations
+## 2. In-Depth Technical Finding Analysis
+
+{% for f in findings %}
+### Finding `{{ f.id[:12] }}`: `{{ f.purl }}`
+
+{{ f.explanation }}
+
+{% if f.evidence %}
+#### Grounded Evidence Artifacts:
+{% for ev in f.evidence %}
+- **Tool**: `{{ ev.tool }}` | **Evidence ID**: `{{ ev.id }}` | **Artifact SHA-256**: `{{ ev.artifact_sha256 }}`
+{% endfor %}
+{% endif %}
+
+---
+{% endfor %}
+
+## 3. Verified Remediations
 
 {% for r in remediations %}
 ### Finding `{{ r.finding_id[:12] }}`
