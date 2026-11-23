@@ -131,8 +131,8 @@ services:
 
   web:
     build:
-      context: .
-      dockerfile: services/web/Dockerfile
+      context: services/web
+      dockerfile: Dockerfile
     container_name: guardian-web
     restart: unless-stopped
     depends_on:
