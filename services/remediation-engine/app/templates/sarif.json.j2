@@ -1,0 +1,49 @@
+{
+  "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+  "version": "2.1.0",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "Supply Chain Guardian",
+          "version": "1.0.0",
+          "rules": [
+            {% for f in findings %}
+            {
+              "id": "{{ f.id }}",
+              "name": "{{ f.kind }}",
+              "shortDescription": {
+                "text": "{{ f.explanation or f.purl }}"
+              }
+            }{% if not loop.last %},{% endif %}
+            {% endfor %}
+          ]
+        }
+      },
+      "properties": {
+        "auditChainHead": "{{ audit_chain_head }}",
+        "runId": "{{ run_id }}"
+      },
+      "results": [
+        {% for f in findings %}
+        {
+          "ruleId": "{{ f.id }}",
+          "level": "{% if f.score and f.score >= 80 %}error{% elif f.score and f.score >= 60 %}warning{% else %}note{% endif %}",
+          "message": {
+            "text": "Component {{ f.purl }} has risk score {{ f.score }}."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "{{ f.path[0] if f.path else 'repo' }}"
+                }
+              }
+            }
+          ]
+        }{% if not loop.last %},{% endif %}
+        {% endfor %}
+      ]
+    }
+  ]
+}

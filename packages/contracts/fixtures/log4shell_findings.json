@@ -1,0 +1,22 @@
+{
+  "finding_id": "finding-log4shell-001",
+  "kind": "cve",
+  "purl": "pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1",
+  "path": ["sample-vulnerable-log4j", "pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1"],
+  "evidence": [
+    {
+      "id": "grype:GHSA-jfh8-c2jp-5v3q",
+      "tool": "grype",
+      "artifact_sha256": "11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff"
+    },
+    {
+      "id": "osv:GHSA-jfh8-c2jp-5v3q",
+      "tool": "osv-scanner",
+      "artifact_sha256": "22334455667788990011bbccddeeff0022334455667788990011bbccddeeff00"
+    }
+  ],
+  "status": "confirmed",
+  "reach_tier": 1,
+  "score": 97,
+  "explanation": "Critical remote code execution vulnerability (Log4Shell) in Log4j 2.14.1. Reachability confirmed in application execution path."
+}

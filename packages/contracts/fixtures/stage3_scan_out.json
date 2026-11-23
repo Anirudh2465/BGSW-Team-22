@@ -1,0 +1,14 @@
+{
+  "run_id": "run-001-log4shell",
+  "stage": "scan",
+  "status": "success",
+  "raw_scan_artifact_sha256": "11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff",
+  "metrics": {
+    "network_isolated": true,
+    "tools_executed": ["syft", "trivy", "cdxgen", "trufflehog"],
+    "raw_vulnerabilities_found": 1
+  },
+  "details": {
+    "offline_verified": true
+  }
+}

@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "guardian-remediation-engine"
+version = "0.1.0"
+description = "Prioritizer, OPA policy, remediator, verifier, and reporter for Supply Chain Guardian"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.110.0",
+    "uvicorn>=0.28.0",
+    "pydantic>=2.5.0",
+    "httpx>=0.27.0",
+    "jinja2>=3.1.3",
+    "guardian-contracts",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+]

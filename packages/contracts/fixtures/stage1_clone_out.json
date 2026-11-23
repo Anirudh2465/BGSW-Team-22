@@ -1,0 +1,18 @@
+{
+  "run_id": "run-001-log4shell",
+  "stage": "clone",
+  "status": "success",
+  "commit_sha": "c0ffee1234567890abcdef1234567890abcdef12",
+  "source_artifact_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "repo_url": "https://github.com/example/sample-vulnerable-log4j",
+  "metrics": {
+    "clone_depth": 1,
+    "file_count": 14,
+    "size_bytes": 1048576,
+    "symlinks_count": 0
+  },
+  "details": {
+    "tree_clean": true,
+    "symlinks_rejected": 0
+  }
+}

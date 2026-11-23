@@ -1,0 +1,34 @@
+# Supply Chain Guardian Security & Remediation Report
+
+**Run ID**: `{{ run_id }}`  
+**Audit Chain Head**: `{{ audit_chain_head }}`  
+
+---
+
+## 1. Executive Summary & Policy Verdicts
+
+| Finding ID | PURL | Reach Tier | Score | Policy Verdict | Status |
+| :--- | :--- | :---: | :---: | :---: | :--- |
+{% for f in findings %}
+| `{{ f.id[:12] }}` | `{{ f.purl }}` | Tier {{ f.reach_tier or 3 }} | **{{ f.score }}** | `{{ policy_verdicts.get(f.id, 'BLOCK') }}` | {{ f.status }} |
+{% endfor %}
+
+---
+
+## 2. Verified Remediations
+
+{% for r in remediations %}
+### Finding `{{ r.finding_id[:12] }}`
+- **State**: `{{ r.state }}`
+- **Chosen Fix Candidate**: `{{ r.candidates[r.chosen] if r.chosen is not none and r.candidates else 'None' }}`
+- **Patch SHA-256**: `{{ r.patch_sha256 or 'N/A' }}`
+- **Verification**: {{ r.validation | tojson if r.validation else 'Pending' }}
+{% endfor %}
+
+---
+
+## 3. Human Approvals
+
+{% for a in approvals %}
+- **Finding**: `{{ a.finding_id[:12] }}` | **Decision**: `{{ a.decision }}` | **Approved Patch**: `{{ a.patch_sha256 or 'N/A' }}`
+{% endfor %}

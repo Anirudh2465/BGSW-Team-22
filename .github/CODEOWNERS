@@ -1,0 +1,9 @@
+/packages/contracts/            @dev2
+/infra/postgres/                @dev2
+/services/launcher/             @dev1
+/services/orchestrator/         @dev2
+/services/scanner-intel/        @dev3
+/services/remediation-engine/   @dev4
+/services/web/                  @dev5
+/tests/                         @dev5
+/docker-compose.yml             @dev1 @dev2

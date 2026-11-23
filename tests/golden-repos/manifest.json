@@ -1,0 +1,44 @@
+{
+  "golden_repos": [
+    {
+      "id": "log4shell-app",
+      "name": "sample-vulnerable-log4j",
+      "url": "https://github.com/example/sample-vulnerable-log4j",
+      "commit_sha": "c0ffee1234567890abcdef1234567890abcdef12",
+      "ecosystem": "maven",
+      "expected_vulnerabilities": ["CVE-2021-44228"],
+      "expected_policy_verdict": "BLOCK",
+      "expected_fix_version": "2.17.1"
+    },
+    {
+      "id": "node-express-app",
+      "name": "sample-vulnerable-node",
+      "url": "https://github.com/example/sample-vulnerable-node",
+      "commit_sha": "beef01234567890abcdef1234567890abcdef12",
+      "ecosystem": "npm",
+      "expected_vulnerabilities": ["CVE-2019-10744"],
+      "expected_policy_verdict": "BLOCK",
+      "expected_fix_version": "4.17.21"
+    },
+    {
+      "id": "python-flask-app",
+      "name": "sample-vulnerable-python",
+      "url": "https://github.com/example/sample-vulnerable-python",
+      "commit_sha": "feed01234567890abcdef1234567890abcdef12",
+      "ecosystem": "pypi",
+      "expected_vulnerabilities": ["CVE-2023-32681"],
+      "expected_policy_verdict": "BLOCK",
+      "expected_fix_version": "2.31.0"
+    },
+    {
+      "id": "clean-microservice",
+      "name": "sample-clean-microservice",
+      "url": "https://github.com/example/sample-clean-microservice",
+      "commit_sha": "cafe01234567890abcdef1234567890abcdef12",
+      "ecosystem": "maven",
+      "expected_vulnerabilities": [],
+      "expected_policy_verdict": "PASS",
+      "expected_fix_version": null
+    }
+  ]
+}

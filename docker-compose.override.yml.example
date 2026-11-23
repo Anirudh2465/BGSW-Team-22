@@ -1,0 +1,30 @@
+# Local development overrides for Supply Chain Guardian
+# Copy to docker-compose.override.yml to activate
+
+services:
+  # Fallback to runc on WSL2 / environments without gVisor
+  launcher:
+    environment:
+      - SANDBOX_RUNTIME=runc
+
+  # Mount local service code for hot-reloading
+  orchestrator:
+    volumes:
+      - ./services/orchestrator/app:/app/app
+      - ./packages/contracts:/app/packages/contracts
+
+  scanner-intel:
+    environment:
+      - ENABLE_OLLAMA=false
+    volumes:
+      - ./services/scanner-intel/app:/app/app
+      - ./packages/contracts:/app/packages/contracts
+
+  remediation-engine:
+    volumes:
+      - ./services/remediation-engine/app:/app/app
+      - ./packages/contracts:/app/packages/contracts
+
+  web:
+    volumes:
+      - ./services/web/src:/app/src

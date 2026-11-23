@@ -1,0 +1,158 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: guardian-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-guardian}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-guardian_dev}
+      POSTGRES_DB: ${POSTGRES_DB:-guardian}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/postgres/001_init.sql:/docker-entrypoint-initdb.d/001_init.sql:ro
+      - ./infra/postgres/002_checkpoints.sql:/docker-entrypoint-initdb.d/002_checkpoints.sql:ro
+    ports:
+      - "5432:5432"
+    networks:
+      - core
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-guardian} -d ${POSTGRES_DB:-guardian}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  launcher:
+    build:
+      context: .
+      dockerfile: services/launcher/Dockerfile
+    container_name: guardian-launcher
+    restart: unless-stopped
+    environment:
+      - SANDBOX_RUNTIME=${SANDBOX_RUNTIME:-runsc}
+      - LAUNCHER_HOST=0.0.0.0
+      - LAUNCHER_PORT=8001
+      - ALLOWLIST_PROXY_PORT=8080
+      - SINKHOLE_PORT=8081
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - launcher
+    ports:
+      - "8001:8001"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  orchestrator:
+    build:
+      context: .
+      dockerfile: services/orchestrator/Dockerfile
+    container_name: guardian-orchestrator
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      launcher:
+        condition: service_healthy
+    environment:
+      - POSTGRES_URL=postgresql://${POSTGRES_USER:-guardian}:${POSTGRES_PASSWORD:-guardian_dev}@postgres:5432/${POSTGRES_DB:-guardian}
+      - LAUNCHER_URL=http://launcher:8001
+      - SCANNER_INTEL_URL=http://scanner-intel:8002
+      - REMEDIATION_ENGINE_URL=http://remediation-engine:8003
+      - AUDIT_ED25519_PRIVATE_KEY_HEX=${AUDIT_ED25519_PRIVATE_KEY_HEX:-}
+      - RECURSION_LIMIT=60
+    networks:
+      - core
+      - launcher
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  scanner-intel:
+    build:
+      context: .
+      dockerfile: services/scanner-intel/Dockerfile
+    container_name: guardian-scanner-intel
+    restart: unless-stopped
+    environment:
+      - ENABLE_OLLAMA=${ENABLE_OLLAMA:-false}
+      - OLLAMA_URL=http://ollama:11434
+    networks:
+      - core
+    ports:
+      - "8002:8002"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  remediation-engine:
+    build:
+      context: .
+      dockerfile: services/remediation-engine/Dockerfile
+    container_name: guardian-remediation-engine
+    restart: unless-stopped
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.5-flash}
+      - GITHUB_WRITER_APP_ID=${GITHUB_WRITER_APP_ID:-}
+      - GITHUB_WRITER_PRIVATE_KEY_PATH=${GITHUB_WRITER_PRIVATE_KEY_PATH:-/secrets/writer.pem}
+      - LAUNCHER_URL=http://launcher:8001
+    volumes:
+      - ./secrets:/secrets:ro
+    networks:
+      - core
+    ports:
+      - "8003:8003"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8003/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  web:
+    build:
+      context: .
+      dockerfile: services/web/Dockerfile
+    container_name: guardian-web
+    restart: unless-stopped
+    depends_on:
+      - orchestrator
+    environment:
+      - NEXT_PUBLIC_ORCHESTRATOR_URL=http://localhost:8000
+      - NEXT_PUBLIC_ORCHESTRATOR_WS_URL=ws://localhost:8000
+    networks:
+      - core
+    ports:
+      - "3000:3000"
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: guardian-ollama
+    restart: unless-stopped
+    profiles:
+      - ollama
+    networks:
+      - core
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+
+networks:
+  core:
+    driver: bridge
+  launcher:
+    driver: bridge
+    internal: true
+
+volumes:
+  postgres_data:
+  ollama_data:

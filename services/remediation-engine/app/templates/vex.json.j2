@@ -1,0 +1,23 @@
+{
+  "@context": "https://openvex.dev/ns/v0.2.0",
+  "@id": "urn:guardian:vex:{{ run_id }}",
+  "author": "Supply Chain Guardian Autonomous Engine",
+  "timestamp": "2026-11-23T14:33:00Z",
+  "version": 1,
+  "statements": [
+    {% for f in findings %}
+    {
+      "vulnerability": {
+        "name": "{{ f.evidence[0].id if f.evidence else f.id }}"
+      },
+      "products": [
+        {
+          "@id": "{{ f.purl }}"
+        }
+      ],
+      "status": "{% if f.reach_tier == 1 and f.score == 0 %}not_affected{% else %}affected{% endif %}",
+      "justification": "{% if f.reach_tier == 1 and f.score == 0 %}vulnerable_code_cannot_be_controlled_by_adversary{% else %}component_present{% endif %}"
+    }{% if not loop.last %},{% endif %}
+    {% endfor %}
+  ]
+}

@@ -1,0 +1,2 @@
+# Simulated sensitive external file outside repository boundary
+CONFIDENTIAL_INFRASTRUCTURE_DATA=secret_key_12345

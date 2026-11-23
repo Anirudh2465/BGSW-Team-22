@@ -1,0 +1,20 @@
+{
+  "run_id": "run-001-log4shell",
+  "stage": "verify",
+  "status": "success",
+  "verified_patch_sha256": "99887766554433221100ffeeddccbbaa99887766554433221100ffeeddccbbaa",
+  "build_success": true,
+  "test_success": true,
+  "rescan_clean": true,
+  "metrics": {
+    "build_duration_ms": 14200,
+    "test_duration_ms": 3100,
+    "post_patch_cve_count": 0
+  },
+  "details": {
+    "sbom_diff": {
+      "old_purl": "pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1",
+      "new_purl": "pkg:maven/org.apache.logging.log4j/log4j-core@2.17.1"
+    }
+  }
+}
