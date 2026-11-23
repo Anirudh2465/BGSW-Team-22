@@ -76,7 +76,7 @@ export function EvidenceDrawer({
           {finding.explanation || "No technical explanation recorded."}
         </div>
         <p className="mt-2 text-[11px] text-ink-muted">
-          All risk scores ($0\text{--}100$) are computed mathematically by code from CVSS, EPSS, CISA KEV, and static call-graph reachability.
+          All risk scores (0 to 100) are computed mathematically by code from CVSS, EPSS, CISA KEV, and static call-graph reachability.
         </p>
       </Section>
 
