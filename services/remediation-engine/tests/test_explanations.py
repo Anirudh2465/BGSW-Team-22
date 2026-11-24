@@ -117,8 +117,8 @@ def test_grounded_explanations_are_shown_and_traceable():
     gem = [e for e in f["log4j"].evidence if e.tool == "gemini"]
     assert gem and json.loads(store.get(gem[0].artifact_sha256))["calls"][0]["model_version"] == "gemini-2.5-flash-test"
     assert SUMMARY_LABEL not in f["low"].explanation  # score < 60 is not sent to Gemini
-    # Score uses the reachability tier: tier 1 -> R = 20 (40 + 23.6 + 15 + 20 = 98.6 -> 99)
-    assert f["log4j"].score == 99
+    # Score uses the reachability tier: tier 1 -> M_reach 1.0 ((50 + 28.32 + 20) * 1.0 = 98.32 -> 98)
+    assert f["log4j"].score == 98
     req = rec.requests[0]
     assert req.headers["x-goog-api-key"] == KEY and KEY not in str(req.url)
     assert KEY.encode() not in store.get(gem[0].artifact_sha256)
@@ -261,7 +261,8 @@ def test_reachability_wording_never_claims_more_than_the_evidence():
     unknown = format_detailed_finding_explanation(low, None, 40, None)
     assert "Not Determined" in unknown and "does NOT mean safe" in unknown and "Confirmed Direct Call Path" not in unknown
     tier1 = format_detailed_finding_explanation(log4j, None, 99, 1)
-    assert "Tier 1 (Application Uses This Library)" in tier1 and "LogConfig-calls->" in tier1 and "R = 20" in tier1
+    assert "Tier 1 (Application Uses This Library)" in tier1 and "LogConfig-calls->" in tier1 and "multiplier 1.0" in tier1
+    assert "multiplier 0.75 (unknown, not safe)" in unknown
     assert "Not applicable" in format_detailed_finding_explanation(planted, None, 80, None)
 
 

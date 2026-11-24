@@ -32,6 +32,7 @@ PRIORITIZE_TIMEOUT_S = float(os.getenv("PRIORITIZE_TIMEOUT_S", "120"))
 POLICY_TIMEOUT_S = float(os.getenv("POLICY_TIMEOUT_S", "60"))
 REMEDIATE_TIMEOUT_S = float(os.getenv("REMEDIATE_TIMEOUT_S", "300"))
 REPORT_TIMEOUT_S = float(os.getenv("REPORT_TIMEOUT_S", "120"))
+PR_TIMEOUT_S = float(os.getenv("PR_TIMEOUT_S", "180"))
 
 class ServiceError(RuntimeError):
     """A downstream service failed; the calling node records a failed gate."""
@@ -274,6 +275,18 @@ class ServiceClients:
         if self.mock_mode:
             raise ServiceError("MOCK_SERVICES: no rescan in mock mode")
         return self._post(f"{self.scanner_url}/rescan", payload, config.RESCAN_TIMEOUT_S)
+
+    def call_assist(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Service-local remediation-engine endpoint: 'Ask Gemini' for one finding."""
+        if self.mock_mode:
+            raise ServiceError("MOCK_SERVICES: no assist in mock mode")
+        return self._post(f"{self.remediation_url}/remediate/assist", payload, REMEDIATE_TIMEOUT_S)
+
+    def call_pull_request(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Service-local remediation-engine endpoint: open the PR for one approved patch (writer App)."""
+        if self.mock_mode:
+            return {"status": "not_configured", "pr_url": None, "reason": "MOCK_SERVICES"}
+        return self._post(f"{self.remediation_url}/pull-request", payload, PR_TIMEOUT_S)
 
     def call_verify(self, req: VerifyRequest) -> VerifyResponse:
         """The Verification gate runs in remediation-engine (code). If it cannot be reached, nothing is

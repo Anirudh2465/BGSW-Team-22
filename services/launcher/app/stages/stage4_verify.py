@@ -67,7 +67,9 @@ modname() { d="${1#./}"; [ "$d" = "." ] || [ -z "$d" ] && d=root; echo "$d" | se
 has() { case " $GUARDIAN_ECOSYSTEMS " in *" $1 "*) return 0;; esac; return 1; }
 in_list() { case " $2 " in *" $1 "*) return 0;; esac; return 1; }
 
-tar -xzf - -C /workspace/in
+# -m: give files the current time. The stored tarball uses mtime 0 so its hash is deterministic, but build
+# tools treat 1970 timestamps badly (maven-resources-plugin 3.2.0 fails copying such resources).
+tar -xzmf - -C /workspace/in
 SRC=/workspace/in/src
 PATCH=/workspace/in/patch.diff
 cd "$SRC" || finish
@@ -77,9 +79,11 @@ s=$(up)
 if git apply --check -v "$PATCH" > "$OUT/logs/patch.check.log" 2>&1; then
   echo "patch.check 0 $s $(up)" >> "$STEPS"
   step patch.apply git apply -v "$PATCH" || finish
+  REVERT="git apply -R -v $PATCH"
 elif patch -p1 --dry-run -i "$PATCH" >> "$OUT/logs/patch.check.log" 2>&1; then
   echo "patch.check 0 $s $(up)" >> "$STEPS"
   step patch.apply patch -p1 -i "$PATCH" || finish
+  REVERT="patch -R -p1 -i $PATCH"
 else
   echo "patch.check 1 $s $(up)" >> "$STEPS"
   finish
@@ -89,6 +93,7 @@ fi
 step sbom.syft syft scan "dir:$SRC" -q -o "cyclonedx-json=$OUT/sbom/syft.cdx.json"
 
 # 3a. Maven
+FAILED_TESTS=""   # ecosystems whose tests failed on the patched tree: re-run on the original tree below
 if has maven; then
   mkdir -p "$OUT/resolved/maven" "$OUT/tests/maven"
   cat > "$HOME/settings.xml" <<EOF
@@ -110,7 +115,8 @@ EOF
     cp "$f" "$OUT/resolved/maven/$(modname "$rel").json"
   done
   if [ "$BUILD_RC" = 0 ]; then
-    step maven.test.root mvn -B -s "$HOME/settings.xml" -Dmaven.repo.local=/workspace/m2 -Dstyle.color=never test
+    step maven.test.root mvn -B -s "$HOME/settings.xml" -Dmaven.repo.local=/workspace/m2 -Dstyle.color=never test \
+      || FAILED_TESTS="$FAILED_TESTS maven"
     find . -path '*/target/surefire-reports/TEST-*.xml' -not -path '*/node_modules/*' | while IFS= read -r f; do
       m=$(modname "$(dirname "$(dirname "$(dirname "$f")")")")
       mkdir -p "$OUT/tests/maven/$m"
@@ -131,7 +137,7 @@ if has npm; then
        && step "npm.build.$n" npm ci --ignore-scripts; then
       if in_list "$d" "$GUARDIAN_NPM_BUILD_DIRS"; then step "npm.buildscript.$n" npm run build; fi
       step "npm.resolve.$n" sh -c "npm ls --all --json > '$OUT/resolved/npm/$n.json'"
-      if in_list "$d" "$GUARDIAN_NPM_TEST_DIRS"; then step "npm.test.$n" npm test; fi
+      if in_list "$d" "$GUARDIAN_NPM_TEST_DIRS"; then step "npm.test.$n" npm test || FAILED_TESTS="$FAILED_TESTS npm:$d"; fi
     fi
     cd "$SRC"
   done
@@ -152,9 +158,47 @@ if has pypi; then
         "$venv/bin/python" -c "import pytest" 2>/dev/null || step "pypi.testdeps.$n" "$venv/bin/pip" install pytest
         cd "$SRC"
         step "pypi.test.$n" "$venv/bin/python" -m pytest -q -p no:cacheprovider --junitxml="$OUT/tests/pypi/$n.xml"
+        rc=$?; [ "$rc" != 0 ] && [ "$rc" != 5 ] && FAILED_TESTS="$FAILED_TESTS pypi:$rq"
       fi
     fi
     cd "$SRC"
+  done
+fi
+
+# 4. Baseline: only when tests failed on the patched tree. Revert the patch and run the same tests on the
+#    original code, so the gate can tell failures the patch caused from failures the project already had
+#    (e.g. tests that need a database the sandbox does not provide).
+if [ -n "$FAILED_TESTS" ]; then
+  cd "$SRC" && step baseline.revert $REVERT || finish
+  for t in $FAILED_TESTS; do
+    case "$t" in
+      maven)
+        cd "$SRC/$GUARDIAN_MAVEN_DIR"
+        find . -path '*/target/surefire-reports' -type d -prune -exec rm -rf {} + 2>/dev/null
+        step maven.basetest.root mvn -B -s "$HOME/settings.xml" -Dmaven.repo.local=/workspace/m2 -Dstyle.color=never test
+        find . -path '*/target/surefire-reports/TEST-*.xml' -not -path '*/node_modules/*' | while IFS= read -r f; do
+          m=$(modname "$(dirname "$(dirname "$(dirname "$f")")")")
+          mkdir -p "$OUT/baseline/maven/$m"
+          cp "$f" "$OUT/baseline/maven/$m/"
+        done
+        cd "$SRC";;
+      npm:*)
+        d="${t#npm:}"; n=$(modname "$d"); cd "$SRC/$d" || continue
+        step "npm.baselock.$n" npm install --package-lock-only --ignore-scripts \
+          && step "npm.basebuild.$n" npm ci --ignore-scripts \
+          && step "npm.basetest.$n" npm test
+        cd "$SRC";;
+      pypi:*)
+        rq="${t#pypi:}"; d=$(dirname "$rq"); n="$(modname "$d")__$(basename "$rq" .txt)"; venv="/workspace/venvb-$n"
+        mkdir -p "$OUT/baseline/pypi"; cd "$SRC/$d" || continue
+        if step "pypi.basevenv.$n" python3 -m venv "$venv" \
+           && step "pypi.basebuild.$n" "$venv/bin/pip" install -r "$(basename "$rq")"; then
+          "$venv/bin/python" -c "import pytest" 2>/dev/null || "$venv/bin/pip" install -q pytest
+          cd "$SRC"
+          step "pypi.basetest.$n" "$venv/bin/python" -m pytest -q -p no:cacheprovider --junitxml="$OUT/baseline/pypi/$n.xml"
+        fi
+        cd "$SRC";;
+    esac
   done
 fi
 finish
@@ -320,6 +364,43 @@ def junit_counts(files: Dict[str, bytes]) -> Dict[str, int]:
     return totals
 
 
+def junit_failing(files: Dict[str, bytes]) -> List[str]:
+    """IDs (classname#name) of the test cases that failed or errored in JUnit XML reports."""
+    out = set()
+    for data in files.values():
+        text = data.decode("utf-8", errors="replace")
+        for m in re.finditer(r"<testcase\b([^>]*?)(/>|>(.*?)</testcase>)", text, re.S):
+            body = m.group(3) or ""
+            if "<failure" in body or "<error" in body:
+                attrs = dict(re.findall(r'(\w+)="([^"]*)"', m.group(1)))
+                out.add(f"{attrs.get('classname', '')}#{attrs.get('name', '')}")
+    return sorted(out)
+
+
+def baseline_result(steps: Dict[str, Dict[str, Any]], out: Dict[str, bytes], step: str, patched_prefix: str,
+                    base_prefix: Optional[str]) -> Dict[str, Any]:
+    """Compare a failed patched test run with the same tests on the original tree (pure).
+
+    preexisting_only = the baseline ran, also failed, and no test fails that did not fail before the patch.
+    With JUnit reports the comparison is per test case; without them (npm) it is by exit code only."""
+    base = steps.get(step)
+    if base is None:
+        return {"ran": False, "preexisting_only": False, "reason": "baseline tests did not run"}
+    base_failed = base["exit_code"] not in (0, 5)
+    if base_prefix is None:
+        return {"ran": True, "base_exit_code": base["exit_code"], "compared_by": "exit_code",
+                "new_failures": [], "preexisting_only": base_failed}
+    patched = set(junit_failing({p: d for p, d in out.items() if p.startswith(patched_prefix)}))
+    before = set(junit_failing({p: d for p, d in out.items() if p.startswith(base_prefix)}))
+    if not patched:  # failed without any failing test case on record: fall back to the exit codes
+        return {"ran": True, "base_exit_code": base["exit_code"], "compared_by": "exit_code",
+                "new_failures": [], "preexisting_only": base_failed, "baseline_failing": sorted(before)[:50]}
+    new = sorted(patched - before)
+    return {"ran": True, "base_exit_code": base["exit_code"], "compared_by": "test_case",
+            "patched_failing": sorted(patched)[:50], "baseline_failing": sorted(before)[:50],
+            "new_failures": new[:50], "preexisting_only": base_failed and not new}
+
+
 def _parse_purl(purl: str) -> Optional[Tuple[str, str, str, str]]:
     m = re.match(r"^pkg:([a-z0-9.+-]+)/([^?#]+)", purl or "")
     if not m:
@@ -467,15 +548,39 @@ def summarise(plan: Dict[str, Any], steps: Dict[str, Dict[str, Any]], out: Dict[
 
     build_success = patch_applied and bool(build_parts) and all(build_parts) and not timed_out
     if patch_applied and not build_success:
-        failed = [n for n, s in steps.items() if s["exit_code"] != 0 and ".test." not in n and n != "sbom.syft"]
+        failed = [n for n, s in steps.items() if s["exit_code"] != 0 and ".test." not in n and n != "sbom.syft"
+                  and ".base" not in n and not n.startswith("baseline.")]
         errors.append(f"build failed: {', '.join(failed) or 'no build step completed'}")
     tests_found = any(t["found"] for t in tests.values())
+    # Failed tests are re-run on the original tree (step 4 of the script): attach that comparison.
+    for key, t in tests.items():
+        if not (t["found"] and t["success"] is False):
+            continue
+        if key == "maven":
+            t["baseline"] = baseline_result(steps, out, "maven.basetest.root", "tests/maven/", "baseline/maven/")
+        elif key.startswith("npm:"):
+            d = key[4:]
+            n = "root" if d in (".", "") else d.replace("/", "__")
+            t["baseline"] = baseline_result(steps, out, f"npm.basetest.{n}", "", None)
+        elif key.startswith("pypi:"):
+            rq = key[5:]
+            mod = "root" if posixpath.dirname(rq) in ("", ".") else posixpath.dirname(rq).replace("/", "__")
+            n = f"{mod}__{posixpath.splitext(posixpath.basename(rq))[0]}"
+            t["baseline"] = baseline_result(steps, out, f"pypi.basetest.{n}", f"tests/pypi/{n}.xml",
+                                            f"baseline/pypi/{n}.xml")
+
     # None = no tests, or they never ran because the build failed first
     tests_success: Optional[bool] = None
+    tests_preexisting = False
     found = [t for t in tests.values() if t["found"]]
-    if any(t["success"] is False for t in found):
+    failing = {k: t for k, t in tests.items() if t["found"] and t["success"] is False}
+    if failing:
         tests_success = False
-        errors.append("tests failed: " + ", ".join(k for k, t in tests.items() if t["found"] and t["success"] is False))
+        tests_preexisting = all((t.get("baseline") or {}).get("preexisting_only") for t in failing.values())
+        if not tests_preexisting:
+            new = {k: (t.get("baseline") or {}).get("new_failures") or [] for k, t in failing.items()}
+            errors.append("tests failed: " + ", ".join(
+                f"{k} ({len(v)} new failing test{'s' if len(v) != 1 else ''})" if v else k for k, v in new.items()))
     elif found and all(t["success"] is True for t in found):
         tests_success = True
     resolved_ok, resolved_checks = check_resolved(target_purls, out) if build_success else (False, [])
@@ -490,6 +595,8 @@ def summarise(plan: Dict[str, Any], steps: Dict[str, Dict[str, Any]], out: Dict[
         "build_success": build_success,
         "tests_found": tests_found,
         "tests_success": tests_success,
+        # tests fail on the patched tree, but the same tests fail without the patch and no new test fails
+        "tests_preexisting_failures": tests_preexisting,
         "tests": tests,
         "resolved_version_matches": resolved_ok,
         "resolved_checks": resolved_checks,
@@ -598,14 +705,14 @@ def run_stage4_verify(run_id: str, source_sha256: str, patch_sha256: str, parame
         "tool_status": {"syft": "ok" if facts["sbom_generated"] else "fail"},
     }
     bundle_files = {p: (d, False) for p, d in out.items()
-                    if (p.startswith("resolved/") and p.endswith(".json")) or p.startswith("tests/")
+                    if (p.startswith("resolved/") and p.endswith(".json")) or p.startswith(("tests/", "baseline/"))
                     or p == "sbom/syft.cdx.json"}
     bundle_files.update({p: (d, False) for p, d in logs.items()})
     bundle_files["manifest.json"] = (json.dumps(manifest, sort_keys=True, indent=1).encode(), False)
     bundle_sha256 = store.put(build_tar(bundle_files))
 
-    passed = (facts["build_success"] and facts["resolved_version_matches"]
-              and facts["tests_success"] is not False and facts["sbom_generated"])
+    passed = (facts["build_success"] and facts["resolved_version_matches"] and facts["sbom_generated"]
+              and (facts["tests_success"] is not False or facts["tests_preexisting_failures"]))
     return {
         "status": "success" if passed else "failure",
         "bundle_sha256": bundle_sha256,

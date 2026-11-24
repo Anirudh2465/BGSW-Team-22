@@ -51,8 +51,12 @@ def patched_sbom(extra=True):
         if c.get("purl") == LOG4J_OLD:
             c.update({"purl": LOG4J_NEW, "bom-ref": LOG4J_NEW, "version": "2.25.4"})
     if extra:
+        # the upgrade pulled in a new direct dependency (graph exposure +5 in the contextual score)
         sbom["components"].append({"type": "library", "bom-ref": MINIMIST, "name": "minimist", "version": "0.0.8",
                                    "purl": MINIMIST})
+        for d in sbom.get("dependencies", []):
+            if d["ref"] == "app":
+                d["dependsOn"] = d["dependsOn"] + [MINIMIST]
     return sbom
 
 

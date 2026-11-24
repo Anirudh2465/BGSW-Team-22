@@ -84,10 +84,12 @@ def test_pipeline_execution_and_approval():
     run_res = client.get(f"/runs/{run_id}")
     assert run_res.status_code == 200
     run_data = run_res.json()
-    assert run_data["status"] == "completed"
+    # Nothing is verified automatically: the run pauses with the draft fix until a human acts.
+    assert run_data["status"] == "awaiting_approval"
     assert gates(run_data) == ["clone_integrity_gate", "manifest_profile_gate", "hook_observation_gate",
                                "coverage_gate", "cross_check_gate", "grounding_gate", "policy_consistency_gate",
-                               "fix_safety_gate", "verification_gate", "human_decision_gate", "completeness_gate"]
+                               "fix_safety_gate"]
+    assert [d["finding_id"] for d in run_data["awaiting_verification"]] == list(run_data["remediations"])
     assert run_data["commit_sha"] == COMMIT  # HEAD pinned to the scanned commit
 
     graph = client.get(f"/runs/{run_id}/graph").json()
@@ -95,12 +97,17 @@ def test_pipeline_execution_and_approval():
     assert graph["coverage"] == {"maven": "scanned"}
 
     events = client.get(f"/runs/{run_id}/events").json()
-    assert events[-1]["payload"]["status"] == "completed"
+    assert events[-1]["payload"]["status"] == "awaiting_approval"
     assert any(e["event_type"] == "gate_result" and e["payload"]["gate_name"] == "coverage_gate" for e in events)
 
-    # Mock services never produce a real stage-4 result, so nothing is verified and nothing waits for approval.
-    rem = next(iter(run_data["remediations"].values()))
+    # Verify on request: mock services never produce a real stage-4 result, so it is escalated, never verified.
+    fid = next(iter(run_data["remediations"]))
+    assert client.post(f"/runs/{run_id}/remediations/{fid}/verify", json={}).status_code == 200
+    run_data = client.get(f"/runs/{run_id}").json()
+    rem = run_data["remediations"][fid]
     assert rem["state"] == "escalated" and "verification not possible" in rem["validation"]["verification"]["reason"]
+    assert run_data["status"] == "completed"   # nothing left to verify or decide -> reporter ran
+    assert gates(run_data)[-3:] == ["verification_gate", "human_decision_gate", "completeness_gate"]
 
     # A completed run accepts no approvals, and an unverified remediation can never be approved.
     RUNS_DB[run_id]["remediations"]["f-1"] = Remediation(
@@ -209,7 +216,7 @@ def _start():
 def test_front_half_brokers_artifacts_and_feeds_bundle_to_discover(fake):
     services = fake()
     run_id, data = _start()
-    assert data["status"] == "completed"
+    assert data["status"] == "awaiting_approval"  # paused with the draft fix: verification is on request
 
     stages = [c[1] for c in services.calls if c[0] == "stage"]
     assert stages == ["clone", "resolve", "scan"]
@@ -282,7 +289,7 @@ def test_coverage_retry_succeeds(fake):
     fake(coverage_results=(False, True))
     run_id, data = _start()
     assert [g["passed"] for g in data["gate_results"] if g["gate"] == "coverage_gate"] == [False, True]
-    assert data["status"] == "completed"
+    assert data["status"] == "awaiting_approval"
 
 
 def test_service_error_becomes_failed_gate(fake, monkeypatch):

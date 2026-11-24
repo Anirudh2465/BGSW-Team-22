@@ -3,12 +3,14 @@
 import React, { useEffect, useState } from "react";
 import { AlertTriangle, CheckCircle2, CircleDashed, FileDiff, GitPullRequest, Lock, Wrench, XCircle } from "lucide-react";
 import { approvePatch, fetchPatch, type Finding, type PendingApproval, type Remediation, type RunData } from "../lib/api";
+import { FindingActions } from "./FindingActions";
+import { AttemptHistory, VerificationChecks } from "./VerificationResult";
 import { Badge, Button, Card, EmptyState, Hash, type Tone } from "./ui";
 import { cn, parsePurl } from "../lib/utils";
 
 const STATE: Record<Remediation["state"], { label: string; tone: Tone; hint: string }> = {
   verified: { label: "Verified in sandbox", tone: "success", hint: "The exact patch built, resolved the target version and cleared the advisory on rescan." },
-  draft: { label: "Awaiting verification", tone: "warning", hint: "The patch has not passed sandbox verification yet, so it cannot be approved." },
+  draft: { label: "Awaiting verification", tone: "warning", hint: "Not verified yet: click Verify fix to build, test and rescan it in the sandbox. Until then it cannot be approved." },
   no_safe_fix: { label: "No safe fix", tone: "danger", hint: "No candidate version qualifies (registry, age, fixes every advisory)." },
   escalated: { label: "Escalated", tone: "danger", hint: "Verification failed or was not possible; a human must fix this by hand." },
 };
@@ -16,19 +18,6 @@ const STATE: Record<Remediation["state"], { label: string; tone: Tone; hint: str
 type Dict = Record<string, any>;
 
 const v = (rem: Remediation) => (rem.validation ?? {}) as Dict;
-
-function Check({ ok, label, detail }: { ok: boolean | null | undefined; label: string; detail?: React.ReactNode }) {
-  const icon = ok === true ? <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" /> : ok === false ? <XCircle className="h-3.5 w-3.5 text-rose-400" /> : <CircleDashed className="h-3.5 w-3.5 text-ink-muted" />;
-  return (
-    <li className="flex items-start gap-2">
-      <span className="mt-0.5 shrink-0">{icon}</span>
-      <span className="min-w-0">
-        <span className="text-ink">{label}</span>
-        {detail ? <span className="block break-words text-[11px] text-ink-muted">{detail}</span> : null}
-      </span>
-    </li>
-  );
-}
 
 function PatchDiff({ runId, sha }: { runId: string; sha: string }) {
   const [open, setOpen] = useState(false);
@@ -62,17 +51,6 @@ function PatchDiff({ runId, sha }: { runId: string; sha: string }) {
   );
 }
 
-function testsLine(s4: Dict) {
-  if (!s4 || !s4.status) return { ok: null, label: "Tests", detail: "not run yet" };
-  if (s4.tests_found === false) return { ok: null, label: "Tests: none found", detail: "the project has no tests" };
-  const totals = Object.values((s4.tests ?? {}) as Dict).reduce(
-    (a: Dict, t: any) => ({ tests: a.tests + (t?.tests ?? 0), failures: a.failures + (t?.failures ?? 0) + (t?.errors ?? 0) }),
-    { tests: 0, failures: 0 },
-  ) as Dict;
-  const counts = totals.tests ? `${totals.tests} run, ${totals.failures} failed` : undefined;
-  return { ok: s4.tests_success ?? null, label: s4.tests_success ? "Tests passed" : s4.tests_success === false ? "Tests failed" : "Tests not run", detail: counts };
-}
-
 /**
  * Human approval queue (Invariant 2): only patches that the sandbox built, re-resolved and rescanned clean can be
  * signed off. The run waits at the approval interrupt until every verified remediation has a decision.
@@ -92,9 +70,10 @@ export function ApprovalQueue({
   const [error, setError] = useState<string | null>(null);
   const list = Object.values(run.remediations ?? {});
   const pending: Record<string, PendingApproval> = Object.fromEntries((run.pending_approvals ?? []).map((p) => [p.finding_id, p]));
-  const waiting = run.status === "awaiting_approval";
+  const waiting = run.status === "awaiting_approval" || !!run.verifying;
 
-  const decide = async (rem: Remediation, decision: "APPROVED" | "REJECTED") => {
+  // Approval goes through FindingActions' "Accept fix" (confirmation run first); only rejection is direct.
+  const decide = async (rem: Remediation, decision: "REJECTED") => {
     if (rem.state !== "verified" || !rem.patch_sha256) return;
     setBusy(rem.finding_id);
     setError(null);
@@ -123,8 +102,10 @@ export function ApprovalQueue({
     <div className="space-y-3">
       {waiting && (
         <div className="rounded-lg bg-amber-500/10 px-3 py-2 text-xs text-amber-200 ring-1 ring-amber-500/25">
-          The run is paused at the approval gate: {decidedCount} of {pendingCount} verified patch{pendingCount === 1 ? "" : "es"} decided. It resumes
-          (reports, then a PR for approved fixes) once every one has a decision.
+          The run is paused for review: {(run.awaiting_verification ?? []).length} fix{(run.awaiting_verification ?? []).length === 1 ? "" : "es"} waiting for
+          &quot;Verify fix&quot;, {decidedCount} of {pendingCount} verified fix{pendingCount === 1 ? "" : "es"} decided. &quot;Accept fix&quot;
+          re-runs the whole pipeline on the patched code and records the approval (and opens the PR) only if that passes. The run resumes once every
+          fix is accepted or rejected.
         </div>
       )}
       {error && <div className="rounded-lg bg-rose-500/10 px-3 py-2 text-xs text-rose-300 ring-1 ring-rose-500/25">Decision failed: {error}</div>}
@@ -142,9 +123,6 @@ export function ApprovalQueue({
         const decision = approval?.decision && approval.decision !== "PENDING" ? approval.decision : recorded?.decision;
         const canDecide = rem.state === "verified" && !!rem.patch_sha256 && waiting && !!pending[rem.finding_id] && !decision;
         const warning: string | undefined = val.warning;
-        const tests = testsLine(s4);
-        const target_rows: Dict[] = (rs.targets ?? []).filter((t: Dict) => t.finding_id === rem.finding_id);
-        const newBlocking: Dict[] = (rs.new_advisories ?? []).filter((a: Dict) => a.risk_band === "Critical" || a.risk_band === "High");
         return (
           <Card key={rem.finding_id} className="overflow-hidden">
             <div className="flex flex-col gap-3 p-5 sm:flex-row sm:items-start sm:justify-between">
@@ -180,60 +158,34 @@ export function ApprovalQueue({
                   </p>
                 )}
               </div>
-              <div className="flex shrink-0 gap-2">
-                {canDecide ? (
-                  <>
-                    <Button variant="secondary" disabled={busy === rem.finding_id} onClick={() => decide(rem, "REJECTED")} title="Reject this patch: no PR is opened">
-                      <XCircle className="h-4 w-4" /> Reject
-                    </Button>
-                    <Button variant="success" disabled={busy === rem.finding_id} onClick={() => decide(rem, "APPROVED")} title={warning ? `Approve despite: ${warning}` : "Approve this verified patch and open a PR"}>
-                      <GitPullRequest className="h-4 w-4" /> {busy === rem.finding_id ? "Signing…" : "Approve"}
-                    </Button>
-                  </>
-                ) : (
-                  <Button variant="secondary" disabled title={st.hint}>
-                    {decision ? (
-                      <>
-                        <CheckCircle2 className="h-4 w-4" /> Decided
-                      </>
-                    ) : (
-                      <>
-                        <Lock className="h-4 w-4" /> {rem.state === "verified" ? "Not awaiting approval" : "Locked: not verified"}
-                      </>
-                    )}
+              <div className="flex shrink-0 flex-col items-end gap-2">
+                <FindingActions run={run} findingId={rem.finding_id} onChanged={onDecided} compact />
+                {canDecide && (
+                  <Button variant="secondary" size="sm" disabled={busy === rem.finding_id} onClick={() => decide(rem, "REJECTED")} title="Reject this patch: no PR is opened">
+                    <XCircle className="h-3.5 w-3.5" /> Reject
                   </Button>
+                )}
+                {!canDecide && !decision && rem.state !== "verified" && (
+                  <span className="inline-flex items-center gap-1 text-[11px] text-ink-muted">
+                    <Lock className="h-3 w-3" /> Locked: not verified
+                  </span>
                 )}
               </div>
             </div>
+            {run.assists?.[rem.finding_id] && (
+              <div className="border-t border-line px-5 py-3">
+                <FindingActions run={run} findingId={rem.finding_id} onChanged={onDecided} />
+              </div>
+            )}
             <div className="grid grid-cols-1 gap-4 border-t border-line bg-white/[0.01] px-5 py-4 text-xs md:grid-cols-2">
               <div>
-                <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-wide text-ink-muted">Sandbox verification</div>
-                <ul className="space-y-1.5">
-                  <Check ok={s4.status ? s4.patch_applied : null} label="Patch applied to a clean checkout" detail={s4.status === "error" ? s4.error : undefined} />
-                  <Check ok={s4.status && s4.status !== "error" ? s4.build_success : null} label="Build" detail={s4.build_success === false ? s4.error : undefined} />
-                  <Check ok={tests.ok} label={tests.label} detail={tests.detail} />
-                  <Check
-                    ok={s4.status && s4.status !== "error" ? s4.resolved_version_matches : null}
-                    label={`Resolves ${target ? parsePurl(target).version : "the target"}`}
-                    detail={(s4.resolved_checks ?? []).map((c: Dict) => (c.matches ? null : `${c.reason}: ${(c.resolved_versions ?? []).join(", ") || "not found"}`)).filter(Boolean).join("; ") || undefined}
-                  />
-                  <Check
-                    ok={rs.status === "ok" ? target_rows.length > 0 && !target_rows.some((t) => t.still_present) : rs.status === "error" ? false : null}
-                    label="Rescan: target advisory gone"
-                    detail={rs.status === "error" ? rs.error : target_rows.flatMap((t) => t.present_as ?? []).join(", ") || undefined}
-                  />
-                  <Check
-                    ok={rs.status === "ok" ? (rs.new_high_or_critical ?? 0) === 0 : null}
-                    label="Rescan: no new Critical/High advisory"
-                    detail={newBlocking.map((a) => `${a.advisory_id} on ${parsePurl(a.purl).name} (${a.risk_band})`).join(", ") || undefined}
-                  />
-                </ul>
-                {s4.metrics?.duration_ms ? <p className="mt-2 text-[11px] text-ink-muted">Stage 4 took {(s4.metrics.duration_ms / 1000).toFixed(0)} s{(s4.metrics.blocked_hosts ?? []).length ? ` · proxy blocked ${(s4.metrics.blocked_hosts as string[]).join(", ")}` : ""}</p> : null}
-                {(val.attempts ?? []).length > 0 && (
-                  <p className="mt-1 text-[11px] text-ink-muted">
-                    Earlier attempts: {(val.attempts as Dict[]).map((a) => (a.candidate ? parsePurl(a.candidate).version : `#${a.chosen}`) + ` (${a.verification?.failed?.join(", ") || a.verification?.outcome || "failed"})`).join("; ")}
-                  </p>
-                )}
+                <div className="mb-1.5 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wide text-ink-muted">
+                  Sandbox verification{target ? ` · ${parsePurl(target).version}` : ""}
+                  {!s4.status && rem.state === "draft" && <span className="normal-case font-normal">not run yet: click Verify</span>}
+                  {run.verifying?.finding_ids?.includes(rem.finding_id) && <span className="normal-case font-normal text-accent-soft">running in the sandbox…</span>}
+                </div>
+                <VerificationChecks runId={run.run_id} findingId={rem.finding_id} s4={s4} rs={rs} ver={ver} target={target} />
+                <AttemptHistory runId={run.run_id} findingId={rem.finding_id} attempts={(val.attempts ?? []) as Dict[]} />
               </div>
               <div className="space-y-2">
                 <div>

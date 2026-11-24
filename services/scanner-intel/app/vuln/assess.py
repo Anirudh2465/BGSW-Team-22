@@ -10,10 +10,9 @@ from . import SCHEMA
 from .enrich import UNKNOWN, Feeds, advisory_cve, cwe_ids, fix_info, select_cvss
 from .match import join, load_sbom
 from .report import enrichment_artifact, explanation, finding_id, sha256, summarise, to_findings, to_json, to_markdown
-from .risk import NEUTRAL_R, calculate_deterministic_risk_score, cvss_severity, risk_band, weakness_category
+from .risk import FORMULA, REACH_UNKNOWN, cvss_severity, risk_band, risk_breakdown, weakness_category
 from .scanners import TOOLS, ToolRun
 
-FORMULA = "round(40*CVSS/10 + 25*EPSS + 15*KEV + R), clamped to 0..100"
 
 
 @dataclass
@@ -67,13 +66,16 @@ def assess_sbom(sbom_bytes: bytes, runs: Dict[str, ToolRun], feeds: Feeds) -> As
         else:
             k_val, k_status, k_date = 0, "not_listed", None
 
-        # Step 4: the team's formula. Unknown inputs count as 0 and are flagged, never dropped.
-        score = calculate_deterministic_risk_score(
+        # Step 4: the contextual formula. Unknown inputs count as 0 and are flagged, never dropped; reachability
+        # is not analysed from an SBOM (M_reach = 0.75), scope / direct / blast radius come from the package graph.
+        breakdown = risk_breakdown(
             cvss=cvss["cvss_score"] or 0.0,
             epss=e_val if isinstance(e_val, float) else 0.0,
             kev=k_val if isinstance(k_val, int) else 0,
             reach_tier=None,
+            scope=comp.scope, direct=comp.direct, blast_radius=comp.blast_radius,
         )
+        score = breakdown["score"]
         cwes = cwe_ids(a.matches)
         v = {
             "finding_id": finding_id(a.purl, a.advisory_id),
@@ -91,6 +93,10 @@ def assess_sbom(sbom_bytes: bytes, runs: Dict[str, ToolRun], feeds: Feeds) -> As
             "epss": e_val, "epss_percentile": e_pct, "epss_status": e_status,
             "kev": k_val, "kev_status": k_status, "kev_date_added": k_date,
             "reach_tier": None,
+            "scope": comp.scope or None,
+            "direct": comp.direct,
+            "blast_radius": comp.blast_radius,
+            "score_terms": {k: (round(v, 6) if isinstance(v, float) else v) for k, v in breakdown.items()},
             "score": score,
             "risk_band": risk_band(score),
             "cwes": cwes,
@@ -117,7 +123,8 @@ def assess_sbom(sbom_bytes: bytes, runs: Dict[str, ToolRun], feeds: Feeds) -> As
     enrichment = enrichment_artifact(sbom_sha, feed_info, vulns)
     enrichment_json = to_json(enrichment)
 
-    notes = ["Reachability was not analysed: the input is an SBOM only, so reach_tier is null and R = 12 (neutral)."]
+    notes = ["Reachability was not analysed: the input is an SBOM only, so reach_tier is null and M_reach = 0.75 "
+             "(unknown, never 'safe'); the prioritizer re-scores with the reachability tier the detector attaches."]
     for t, info in tools_info.items():
         if info["status"] != "ok":
             notes.append(f"{t} did not contribute ({info['status']}): {info['error'] or 'no output'}. "
@@ -134,13 +141,13 @@ def assess_sbom(sbom_bytes: bytes, runs: Dict[str, ToolRun], feeds: Feeds) -> As
     report = {
         "schema": SCHEMA,
         "sbom": {"sha256": sbom_sha, "spec_version": sbom.get("specVersion"), "serial_number": sbom.get("serialNumber")},
-        "method": {"formula": FORMULA, "reach_tier": None, "R": NEUTRAL_R,
+        "method": {"formula": FORMULA, "reach_tier": None, "M_reach": REACH_UNKNOWN,
                    "risk_bands": {"Critical": "80-100", "High": "60-79", "Medium": "30-59", "Low": "0-29"},
                    "cvss_preference": ["3.1", "3.0", "4.0", "2.0"], "llm": "none"},
         "tools": tools_info,
         "feeds": feed_info,
         "coverage": coverage,
-        "reachability": {"analysed": False, "reach_tier": None, "R": NEUTRAL_R, "note": "not analysed, SBOM only"},
+        "reachability": {"analysed": False, "reach_tier": None, "M_reach": REACH_UNKNOWN, "note": "not analysed, SBOM only"},
         "summary": summarise(vulns),
         "enrichment_sha256": sha256(enrichment_json),
         "unjoined": unjoined,

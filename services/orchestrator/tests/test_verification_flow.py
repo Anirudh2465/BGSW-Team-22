@@ -2,6 +2,7 @@
 scanner-intel and remediation-engine behind the real client methods. Routing, the retry cap, the
 checkpointed interrupt and the approval API are the real code."""
 
+import difflib
 import hashlib
 import os
 import sys
@@ -20,6 +21,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import app.main as main
+from app import confirm
 from app.clients import MOCK_DEP_GRAPH, ServiceError, service_clients
 from app.db.artifacts import artifact_store
 from app.db.audit_chain import audit_chain
@@ -42,13 +44,37 @@ def sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+POM = (REPO_ROOT / "tests" / "golden-repos" / "log4shell_app" / "pom.xml").read_text()
+LOG4J = "pkg:maven/org.apache.logging.log4j/log4j-core"
+
+
+def source_tar(pom: str = POM) -> bytes:
+    return confirm._pack({"pom.xml": (pom.encode(), 0o644), "src/main/java/App.java": (b"class App {}", 0o644)})
+
+
+def pom_version(source_sha: str) -> str:
+    tar = artifact_store.get(source_sha)
+    files = confirm._read_files(tar) if tar else {}
+    text = files.get("pom.xml", (b"",))[0].decode()
+    import re as _re
+    m = _re.search(r"<artifactId>log4j-core</artifactId>\s*<version>([^<]+)</version>", text)
+    return m.group(1) if m else "?"
+
+
+def pom_diff(version: str) -> bytes:
+    new = POM.replace("<version>2.14.1</version>", f"<version>{version}</version>")
+    return "".join(difflib.unified_diff(POM.splitlines(True), new.splitlines(True), "a/pom.xml", "b/pom.xml")).encode()
+
+
 class Backend:
     """Launcher + scanner-intel + remediation-engine, as seen through the orchestrator's client methods."""
 
-    def __init__(self, verify_outcomes=(True,), tests_found=True, launcher_down=False, rescan_down=False):
+    def __init__(self, verify_outcomes=(True,), tests_found=True, launcher_down=False, rescan_down=False,
+                 new_high_after_patch=False, assist=None):
         self.outcomes = list(verify_outcomes)     # one per stage-4 call: build/tests pass?
         self.tests_found, self.launcher_down, self.rescan_down = tests_found, launcher_down, rescan_down
-        self.launcher, self.calls, self.reports = {}, [], []
+        self.new_high_after_patch, self.assist = new_high_after_patch, assist
+        self.launcher, self.calls, self.reports, self.prs = {}, [], [], {}
 
     def blob(self, label: str) -> str:
         data = f"{label}-{len(self.launcher)}".encode()
@@ -59,8 +85,10 @@ class Backend:
     def run_launcher_stage(self, req):
         self.calls.append(("stage", req.stage, req.patch_artifact_sha256, dict(req.parameters)))
         if req.stage == "clone":
+            src = source_tar()
+            self.launcher[sha(src)] = src
             return StageRunResponse(run_id=req.run_id, stage="clone", status="success",
-                                    artifact_sha256=self.blob("source"), details={"commit_sha": COMMIT})
+                                    artifact_sha256=sha(src), details={"commit_sha": COMMIT})
         if req.stage in ("resolve", "scan"):
             return StageRunResponse(run_id=req.run_id, stage=req.stage, status="success",
                                     artifact_sha256=self.blob(req.stage), logs_artifact_sha256=self.blob("sink"),
@@ -91,15 +119,25 @@ class Backend:
                                     check_plan=["cve_scan"], gate_passed=True, clone_integrity_details={})
 
     def call_discover(self, req):
-        return DiscoverResponse(run_id=req.run_id, sbom_artifact_sha256=sha(b"sbom"), dep_graph=MOCK_DEP_GRAPH,
+        """The dependency graph follows the pom in the (possibly patched) source tarball."""
+        version = pom_version(req.source_artifact_sha256)
+        graph = {**MOCK_DEP_GRAPH, "nodes": [{"id": "app"}, {"id": f"{LOG4J}@{version}"},
+                                             {"id": f"pkg:maven/org.apache.logging.log4j/log4j-api@{version}"}]}
+        return DiscoverResponse(run_id=req.run_id, sbom_artifact_sha256=sha(b"sbom"), dep_graph=graph,
                                 coverage={"maven": "scanned"}, gate_passed=True)
 
     def call_detect(self, req):
         ev = [Evidence(id="grype:GHSA-jfh8-c2jp-5v3q", tool="grype", artifact_sha256=sha(b"g")),
               Evidence(id="enrichment:GHSA-jfh8-c2jp-5v3q", tool="guardian-enrichment", artifact_sha256=sha(b"e"))]
-        return DetectResponse(run_id=req.run_id, gate_passed=True, cross_check_summary={}, findings=[
-            Finding(id=fid, kind="cve", purl="pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1",
-                    evidence=ev, status="confirmed", score=97) for fid in FINDINGS])
+        version = pom_version(req.source_artifact_sha256)
+        if version == "2.14.1":
+            return DetectResponse(run_id=req.run_id, gate_passed=True, cross_check_summary={}, findings=[
+                Finding(id=fid, kind="cve", purl=f"{LOG4J}@2.14.1", evidence=ev, status="confirmed", score=97)
+                for fid in FINDINGS])
+        extra = [Finding(id="f-new", kind="cve", purl="pkg:maven/org.example/new-dep@1.0", status="confirmed",
+                         score=88, evidence=[Evidence(id="grype:CVE-2099-1", tool="grype", artifact_sha256=sha(b"x"))])]
+        return DetectResponse(run_id=req.run_id, gate_passed=True, cross_check_summary={},
+                              findings=extra if self.new_high_after_patch else [])
 
     def call_rescan(self, payload):
         self.calls.append(("rescan", payload["patch_sha256"], payload["base_enrichment_sha256"]))
@@ -121,7 +159,7 @@ class Backend:
                               gate_passed=True, rule_evaluations=[])
 
     def _patch(self, run_id, idx):
-        return artifact_store.put(run_id, "remediate", "text/x-diff", f"--- a/pom.xml\n+++ b/pom.xml\n@@ {idx}\n".encode())
+        return artifact_store.put(run_id, "remediate", "text/x-diff", pom_diff(CANDIDATES[idx].rsplit("@", 1)[1]))
 
     def call_remediate(self, req):
         patch = self._patch(req.run_id, 0)
@@ -136,7 +174,11 @@ class Backend:
         for r in rems:
             nxt = r.chosen + 1
             v = {k: x for k, x in (r.validation or {}).items() if k not in ("stage4", "rescan", "verification")}
-            v["attempts"] = list((r.validation or {}).get("attempts") or []) + [{"patch_sha256": r.patch_sha256}]
+            prev = r.validation or {}
+            v["attempts"] = list(prev.get("attempts") or []) + [{   # same history as the real remediator
+                "chosen": r.chosen, "candidate": r.candidates[r.chosen], "patch_sha256": r.patch_sha256,
+                "retry_count": r.retry_count, "verification": prev.get("verification"),
+                "stage4": prev.get("stage4"), "rescan": prev.get("rescan")}]
             if nxt >= len(r.candidates):
                 out.append(r.model_copy(update={"state": "escalated", "validation": {
                     **v, "verification": {"outcome": "escalated", "reason": "no further candidate"}}}))
@@ -170,15 +212,24 @@ class Backend:
 
     def call_report(self, req):
         self.reports.append({a.finding_id: a.decision for a in req.approvals})
-        approved = any(a.decision == "APPROVED" for a in req.approvals)
         return ReportResponse(run_id=req.run_id, markdown_report_sha256="m", sarif_report_sha256="s",
-                              vex_report_sha256="v", pr_url="https://github.com/fork/pr/1" if approved else None,
-                              gate_passed=True)
+                              vex_report_sha256="v", pr_url=None, gate_passed=True)
+
+    def call_pull_request(self, payload):
+        """Writer App stand-in: idempotent per patch, like the real one."""
+        self.calls.append(("pr", payload["patch_sha256"], tuple(payload["finding_ids"])))
+        assert payload["commit_sha"] == COMMIT and payload["approved_by"]
+        url = self.prs.setdefault(payload["patch_sha256"], f"https://github.com/fork/pull/{len(self.prs) + 1}")
+        return {"status": "opened", "pr_url": url}
+
+    def call_assist(self, payload):
+        self.calls.append(("assist", payload["finding"]["id"]))
+        return self.assist(payload)
 
 
 METHODS = ("run_launcher_stage", "fetch_launcher_artifact", "ensure_launcher_artifact", "call_cartographer",
            "call_discover", "call_detect", "call_rescan", "call_prioritize", "call_policy", "call_remediate",
-           "call_remediate_next", "call_verify", "call_report")
+           "call_remediate_next", "call_verify", "call_report", "call_pull_request", "call_assist")
 
 
 @pytest.fixture
@@ -206,47 +257,103 @@ def approve(run_id, fid, patch, decision="APPROVED"):
                                                         "user_id": "secops-1", "patch_sha256": patch})
 
 
-# --------------------------------------------------------------------------- retry loop
-def test_failed_candidate_0_then_verified_candidate_1_waits_for_approval(backend):
-    b = backend(verify_outcomes=(False, True))
+# --------------------------------------------------------------------------- verification on request
+def verify_click(run_id, fid):
+    return client.post(f"/runs/{run_id}/remediations/{fid}/verify", json={"user_id": "secops-1"})
+
+
+def stage4_calls(b):
+    return [c for c in b.calls if c[:2] == ("stage", "verify")]
+
+
+def test_nothing_is_verified_without_a_click(backend):
+    b = backend()
     run_id, run = start()
     assert run["status"] == "awaiting_approval"
-    rems = run["remediations"]
-    assert {r["state"] for r in rems.values()} == {"verified"}
-    r = rems[FINDINGS[0]]
-    assert r["retry_count"] == 1 and r["chosen"] == 1
-    assert r["validation"]["stage4"]["build_success"] is True
-    assert r["validation"]["rescan"]["targets_cleared"] is True
+    assert stage4_calls(b) == [] and not [c for c in b.calls if c[0] == "rescan"]
+    assert {r["state"] for r in run["remediations"].values()} == {"draft"}
+    assert {d["finding_id"] for d in run["awaiting_verification"]} == set(FINDINGS)
+    assert run["pending_approvals"] == [] and b.reports == []
+    assert gate_names(run)[-1] == "fix_safety_gate"
+    # approval_gate_node is side-effect free before interrupt(): no audit entry for it yet
+    assert not [e for e in audit_chain.get_entries(run_id) if e["node_name"] == "approval_gate_node"]
+
+
+def test_one_click_verifies_one_patch_for_all_its_findings(backend):
+    b = backend(tests_found=False)
+    run_id, _ = start()
+    res = verify_click(run_id, FINDINGS[0])
+    assert res.status_code == 200 and res.json()["finding_ids"] == sorted(FINDINGS)
+    run = client.get(f"/runs/{run_id}").json()
+    assert len(stage4_calls(b)) == 1 and stage4_calls(b)[0][3]["target_purls"] == [CANDIDATES[0]]
+    assert {r["state"] for r in run["remediations"].values()} == {"verified"}
+    r = run["remediations"][FINDINGS[0]]
+    assert r["validation"]["stage4"]["build_success"] is True and r["validation"]["rescan"]["targets_cleared"] is True
+    assert r["validation"]["warning"].startswith("no tests")
     assert "unchanged" not in r["validation"]["rescan"]["diff"]  # big lists stay in the rescan artifact
-    # one stage-4 run per distinct patch (both findings share it), never per finding
-    verify_calls = [c for c in b.calls if c[:2] == ("stage", "verify")]
-    assert len(verify_calls) == 2 and verify_calls[0][2] != verify_calls[1][2]
-    assert verify_calls[0][3]["target_purls"] == [CANDIDATES[0]] and verify_calls[1][3]["target_purls"] == [CANDIDATES[1]]
-    assert ("next", 2) in b.calls
+    assert ("ensure", r["patch_sha256"]) in b.calls             # source + patch pushed to the launcher by hash
     assert all(c[2] == sha(b"e") for c in b.calls if c[0] == "rescan")  # baseline = detect's enrichment
-    # source and patch pushed to the launcher by hash before each verify
-    assert ("ensure", r["patch_sha256"]) in b.calls
-    assert gate_names(run)[-3:] == ["verification_gate", "fix_safety_gate", "verification_gate"]
-    assert {p["finding_id"] for p in run["pending_approvals"]} == set(FINDINGS)
+    assert run["status"] == "awaiting_approval" and {p["finding_id"] for p in run["pending_approvals"]} == set(FINDINGS)
+    assert run["awaiting_verification"] == [] and run["verifying"] is None
 
 
-def test_three_failures_escalate_without_approval(backend):
+def test_a_failed_verification_writes_the_next_candidate_and_waits_for_the_next_click(backend):
+    b = backend(verify_outcomes=(False, True))
+    run_id, _ = start()
+    verify_click(run_id, FINDINGS[0])
+    run = client.get(f"/runs/{run_id}").json()
+    r = run["remediations"][FINDINGS[0]]
+    assert r["state"] == "draft" and r["chosen"] == 1 and r["retry_count"] == 1
+    assert len(stage4_calls(b)) == 1                                   # no automatic second attempt
+    assert [d["target"] for d in run["awaiting_verification"]][0] == CANDIDATES[1]
+    assert run["awaiting_verification"][0]["previous_failed"] is not None or r["validation"]["attempts"]
+    verify_click(run_id, FINDINGS[0])
+    run = client.get(f"/runs/{run_id}").json()
+    assert run["remediations"][FINDINGS[0]]["state"] == "verified" and len(stage4_calls(b)) == 2
+    assert stage4_calls(b)[1][3]["target_purls"] == [CANDIDATES[1]]
+
+
+def test_step_logs_of_each_attempt_are_served_from_this_runs_bundles(backend):
+    backend(verify_outcomes=(False, True))
+    run_id, _ = start()
+    verify_click(run_id, FINDINGS[0])
+    # the fake launcher's bundle is an opaque blob: put a real bundle tar on the failed attempt to read it back
+    log = confirm._pack({"logs/maven.build.root.log": (b"[ERROR] COMPILATION ERROR\n", 0o644)})
+    real = artifact_store.put(run_id, "verify", "application/gzip", log)
+    main.RUNS_DB[run_id]["remediations"][FINDINGS[0]].validation["attempts"][0]["stage4"]["bundle_sha256"] = real
+    res = client.get(f"/runs/{run_id}/verify-log/{real}/maven.build.root")
+    assert res.status_code == 200 and "COMPILATION ERROR" in res.text
+    assert client.get(f"/runs/{run_id}/verify-log/{real}/maven.test.root").status_code == 404
+    assert client.get(f"/runs/{run_id}/verify-log/{sha(b'x')}/maven.build.root").status_code == 404
+    assert client.get(f"/runs/{run_id}/verify-log/{real}/..%2Fetc").status_code in (400, 404)
+
+
+def test_three_failed_clicks_escalate_and_the_run_reports(backend):
     b = backend(verify_outcomes=(False, False, False))
-    run_id, run = start()
-    assert run["status"] == "completed"
+    run_id, _ = start()
+    for _ in range(3):
+        assert verify_click(run_id, FINDINGS[0]).status_code == 200
+    run = client.get(f"/runs/{run_id}").json()
     assert {r["state"] for r in run["remediations"].values()} == {"escalated"}
     assert max(r["retry_count"] for r in run["remediations"].values()) == 2
-    assert len([c for c in b.calls if c[:2] == ("stage", "verify")]) == 3
-    assert "human_decision_gate" in gate_names(run) and run["pending_approvals"] == []
-    # recursion limit not hit: the whole run finished well inside it
-    steps = [e for e in client.get(f"/runs/{run_id}/events").json() if e["event_type"] == "node_progress"]
-    assert len(steps) < builder.GuardianGraphRunner().recursion_limit == 60
+    assert len(stage4_calls(b)) == 3
+    assert run["status"] == "completed" and gate_names(run)[-1] == "completeness_gate"
+    assert verify_click(run_id, FINDINGS[0]).status_code == 409
+
+
+def test_verify_refuses_non_drafts_and_busy_runs(backend):
+    backend()
+    run_id, _ = start()
+    verify_click(run_id, FINDINGS[0])
+    assert verify_click(run_id, FINDINGS[0]).status_code == 409   # already verified
+    assert verify_click(run_id, "unknown").status_code == 400
 
 
 def test_launcher_unreachable_is_escalated_never_verified(backend):
     b = backend(launcher_down=True)
-    _, run = start()
-    assert run["status"] == "completed"
+    run_id, _ = start()
+    verify_click(run_id, FINDINGS[0])
+    run = client.get(f"/runs/{run_id}").json()
     for r in run["remediations"].values():
         assert r["state"] == "escalated"
         assert "launcher unreachable" in r["validation"]["stage4"]["error"]
@@ -255,7 +362,9 @@ def test_launcher_unreachable_is_escalated_never_verified(backend):
 
 def test_rescan_unreachable_is_escalated(backend):
     backend(rescan_down=True)
-    _, run = start()
+    run_id, _ = start()
+    verify_click(run_id, FINDINGS[0])
+    run = client.get(f"/runs/{run_id}").json()
     assert {r["state"] for r in run["remediations"].values()} == {"escalated"}
     assert run["remediations"][FINDINGS[0]]["validation"]["rescan"]["status"] == "error"
 
@@ -267,49 +376,152 @@ def test_routing_rules_are_bounded():
     assert needs_retry(rem("draft", "retry", 1)) and not needs_retry(rem("draft", "retry", 2))
     assert not needs_retry(rem("no_safe_fix", "retry", 0)) and not needs_retry(rem("escalated", "retry", 0))
     assert should_retry_remediation({"remediations": {"x": rem("draft", "retry", 0)}}) == "retry"
-    assert should_retry_remediation({"remediations": {"x": rem("verified", "verified", 0)}}) == "approval_gate"
     assert should_retry_remediation({"remediations": {}}) == "approval_gate"
 
 
-# --------------------------------------------------------------------------- approval interrupt
-def test_approval_resumes_the_checkpointed_graph_and_reports(backend):
-    b = backend(tests_found=False)
-    run_id, run = start()
-    assert run["status"] == "awaiting_approval"
+def test_finish_closes_the_run_with_unverified_fixes_deferred(backend):
+    b = backend()
+    run_id, _ = start()
+    res = client.post(f"/runs/{run_id}/finish", json={"user_id": "secops-1"})
+    assert res.status_code == 200
+    run = client.get(f"/runs/{run_id}").json()
+    assert run["status"] == "completed" and stage4_calls(b) == []
+    assert {a["decision"] for a in run["approvals"].values()} == {"PENDING"}  # deferred, never approved
+    assert {r["state"] for r in run["remediations"].values()} == {"draft"}
+    assert run["final_report"]["pr_url"] is None and not [c for c in b.calls if c[0] == "pr"]
+    human = [g for g in run["gate_results"] if g["gate"] == "human_decision_gate"][-1]
+    assert human["finished_by_user"] is True and human["deferred"] == 2
+
+
+# --------------------------------------------------------------------------- accept / reject
+def accept(run_id, fid, patch, user="secops-1"):
+    return client.post(f"/runs/{run_id}/remediations/{fid}/accept", json={"user_id": user, "patch_sha256": patch})
+
+
+def start_verified(backend, **kw):
+    b = backend(**kw)
+    run_id, _ = start()
+    verify_click(run_id, FINDINGS[0])
+    return b, run_id, client.get(f"/runs/{run_id}").json()
+
+
+def test_accept_runs_a_confirmation_pipeline_then_approves_and_opens_the_pr(backend):
+    b, run_id, run = start_verified(backend, tests_found=False)
     patch = run["remediations"][FINDINGS[0]]["patch_sha256"]
-    assert run["remediations"][FINDINGS[0]]["validation"]["warning"].startswith("no tests")
-    assert [p["warning"] for p in run["pending_approvals"]][0].startswith("no tests")
-    assert b.reports == []  # the reporter has not run: the graph is paused at the interrupt
+    assert b.reports == [] and not [c for c in b.calls if c[0] == "pr"]  # nothing happens without the click
 
-    # approval_gate_node is side-effect free before interrupt(): no audit entry for it yet
-    assert not [e for e in audit_chain.get_entries(run_id) if e["node_name"] == "approval_gate_node"]
+    assert approve(run_id, FINDINGS[0], patch).status_code == 409        # direct approval is refused
+    assert accept(run_id, FINDINGS[0], "0" * 64).status_code == 400       # wrong hash
 
-    assert approve(run_id, FINDINGS[0], "0" * 64).status_code == 400          # wrong hash
-    first = approve(run_id, FINDINGS[0], patch)
-    assert first.status_code == 200 and first.json()["status"] == "recorded"  # waits for the other decision
-    assert client.get(f"/runs/{run_id}").json()["status"] == "awaiting_approval"
-    assert approve(run_id, "unknown", patch).status_code == 400
+    res = accept(run_id, FINDINGS[0], patch)
+    assert res.status_code == 200 and res.json()["status"] == "started"
+    conf = res.json()["confirmation"]
+    assert conf["finding_ids"] == sorted(FINDINGS)  # one patch fixes both findings: accepted for both
 
-    second = approve(run_id, FINDINGS[1], patch, decision="REJECTED")
-    assert second.json()["status"] == "resumed"
+    child = client.get(f"/runs/{conf['child_run_id']}").json()
+    assert child["kind"] == "confirmation" and child["parent_run_id"] == run_id and child["status"] == "completed"
+    assert gate_names(child) == ["clone_integrity_gate", "manifest_profile_gate", "hook_observation_gate",
+                                 "coverage_gate", "cross_check_gate", "grounding_gate", "policy_consistency_gate",
+                                 "confirmation_gate"]
+    assert child["source_sha256"] != run["source_sha256"] and pom_version(child["source_sha256"]) == "2.25.4"
+    assert child["final_report"]["passed"] is True
+    assert len([c for c in b.calls if c[:2] == ("stage", "clone")]) == 1   # the patched copy is not re-cloned
+
+    run = client.get(f"/runs/{run_id}").json()
+    assert run["status"] == "completed"                               # all decided -> resumed -> reported
+    assert run["confirmations"][patch]["status"] == "passed"
+    assert run["confirmations"][patch]["pull_request"]["pr_url"] == "https://github.com/fork/pull/1"
+    assert {a["decision"] for a in run["approvals"].values()} == {"APPROVED"}
+    assert run["final_report"]["pr_url"] == "https://github.com/fork/pull/1"   # reporter: same PR, idempotent
+    assert b.reports == [{FINDINGS[0]: "APPROVED", FINDINGS[1]: "APPROVED"}]
+    assert len([e for e in audit_chain.get_entries(run_id) if e["node_name"] == "approval_gate_node"]) == 1
+    assert accept(run_id, FINDINGS[0], patch).status_code == 409     # no longer waiting
+
+
+def test_failed_confirmation_records_nothing(backend):
+    b, run_id, run = start_verified(backend, new_high_after_patch=True)
+    patch = run["remediations"][FINDINGS[0]]["patch_sha256"]
+    accept(run_id, FINDINGS[0], patch)
+    run = client.get(f"/runs/{run_id}").json()
+    conf = run["confirmations"][patch]
+    assert conf["status"] == "failed" and conf["failed"] == ["no_new_high_or_critical"]
+    assert run["status"] == "awaiting_approval" and run["decisions"] == {} and run["approvals"] == {}
+    assert not [c for c in b.calls if c[0] == "pr"]
+
+
+def test_reject_resumes_without_pr(backend):
+    b, run_id, run = start_verified(backend)
+    patch = run["remediations"][FINDINGS[0]]["patch_sha256"]
+    assert approve(run_id, FINDINGS[0], patch, "REJECTED").json()["status"] == "recorded"
+    assert approve(run_id, FINDINGS[1], patch, "REJECTED").json()["status"] == "resumed"
+    run = client.get(f"/runs/{run_id}").json()
+    assert run["status"] == "completed" and {a["decision"] for a in run["approvals"].values()} == {"REJECTED"}
+    assert run["final_report"]["pr_url"] is None and not [c for c in b.calls if c[0] == "pr"]
+
+
+# --------------------------------------------------------------------------- ask Gemini
+def gemini_assist(version="2.24.3"):
+    def assist(payload):
+        rem = payload["remediation"]
+        patch = artifact_store.put(payload["run_id"], "assist", "text/x-diff", pom_diff(version))
+        return {"remediation": {"finding_id": payload["finding"]["id"], "candidates": [CANDIDATES[2]], "chosen": 0,
+                                "patch_sha256": patch, "retry_count": 0, "state": "draft",
+                                "validation": {"selection": {"decided_by": "gemini_on_request"},
+                                               "attempts": [{"patch_sha256": (rem or {}).get("patch_sha256")}]}},
+                "assist": {"summary": "Upgrade to 2.24.3 [grype:GHSA-jfh8-c2jp-5v3q]", "gemini": {"status": "ok"}}}
+    return assist
+
+
+def test_ask_gemini_gives_a_new_fix_that_still_waits_for_verify(backend):
+    b = backend(verify_outcomes=(False, False, False, True), assist=gemini_assist())
+    run_id, _ = start()
+    for _ in range(3):
+        verify_click(run_id, FINDINGS[0])
+    assert client.get(f"/runs/{run_id}").json()["status"] == "completed"   # everything escalated
+
+    res = client.post(f"/runs/{run_id}/findings/{FINDINGS[0]}/ask-ai", json={"user_id": "secops-1"})
+    assert res.status_code == 200 and res.json()["remediation"]["state"] == "draft"
+    run = client.get(f"/runs/{run_id}").json()
+    assert run["status"] == "awaiting_approval" and len(stage4_calls(b)) == 3   # not verified automatically
+    assert [d["finding_id"] for d in run["awaiting_verification"]] == [FINDINGS[0]]
+    assert run["assists"][FINDINGS[0]]["decided_by"] == "gemini_on_request"
+
+    verify_click(run_id, FINDINGS[0])
+    run = client.get(f"/runs/{run_id}").json()
+    assert run["remediations"][FINDINGS[0]]["state"] == "verified" and len(stage4_calls(b)) == 4
+    assert [p["finding_id"] for p in run["pending_approvals"]] == [FINDINGS[0]]
+    assert run["remediations"][FINDINGS[1]]["state"] == "escalated"          # the other finding is untouched
+
+
+def test_ask_gemini_for_a_non_upgrade_finding_records_advice(backend):
+    def assist(payload):
+        return {"remediation": {"finding_id": payload["finding"]["id"], "state": "escalated", "candidates": [],
+                                "validation": {"remediation": {"reason": "not an upgrade"},
+                                               "assist": {"advice": {"code": "remove_or_replace_dependency"}}}},
+                "assist": {"advice": {"code": "remove_or_replace_dependency", "text": "remove it"}, "summary": None}}
+
+    backend(verify_outcomes=(False, False, False), assist=assist)
+    run_id, _ = start()
+    for _ in range(3):
+        verify_click(run_id, FINDINGS[0])
+    assert client.post(f"/runs/{run_id}/findings/{FINDINGS[1]}/ask-ai", json={}).status_code == 200
     run = client.get(f"/runs/{run_id}").json()
     assert run["status"] == "completed"
-    assert run["approvals"][FINDINGS[0]]["decision"] == "APPROVED"
-    assert run["approvals"][FINDINGS[0]]["patch_sha256"] == patch
-    assert run["approvals"][FINDINGS[1]]["decision"] == "REJECTED"
-    assert b.reports == [{FINDINGS[0]: "APPROVED", FINDINGS[1]: "REJECTED"}]
-    assert run["final_report"]["pr_url"] == "https://github.com/fork/pr/1"
-    assert gate_names(run)[-2:] == ["human_decision_gate", "completeness_gate"]
-    human = [g for g in run["gate_results"] if g["gate"] == "human_decision_gate"][-1]
-    assert human["passed"] is True and human["decided"] == 2
-    # exactly one audit entry for the gate although LangGraph re-ran the node on resume
-    assert len([e for e in audit_chain.get_entries(run_id) if e["node_name"] == "approval_gate_node"]) == 1
-    assert approve(run_id, FINDINGS[0], patch).status_code == 409             # no longer waiting
+    assert run["assists"][FINDINGS[1]]["advice"]["code"] == "remove_or_replace_dependency"
 
 
+def test_ask_gemini_refuses_verified_and_unknown_findings(backend):
+    _, run_id, _ = start_verified(backend)
+    assert client.post(f"/runs/{run_id}/findings/{FINDINGS[0]}/ask-ai", json={}).status_code == 409
+    assert client.post(f"/runs/{run_id}/findings/nope/ask-ai", json={}).status_code == 404
+
+
+# --------------------------------------------------------------------------- patches, checkpoints, recovery
 def test_patch_endpoint_serves_only_this_runs_patches(backend):
     backend(verify_outcomes=(False, True))
-    run_id, run = start()
+    run_id, _ = start()
+    verify_click(run_id, FINDINGS[0])
+    run = client.get(f"/runs/{run_id}").json()
     r = run["remediations"][FINDINGS[0]]
     res = client.get(f"/runs/{run_id}/patches/{r['patch_sha256']}")
     assert res.status_code == 200 and res.text.startswith("--- a/pom.xml")
@@ -317,26 +529,38 @@ def test_patch_endpoint_serves_only_this_runs_patches(backend):
     assert client.get(f"/runs/{run_id}/patches/{old}").status_code == 200   # earlier attempt, same run
     assert client.get(f"/runs/{run_id}/patches/{sha(b'other')}").status_code == 404
     pending = client.get(f"/runs/{run_id}/approvals").json()
-    assert pending["status"] == "awaiting_approval" and len(pending["pending"]) == 2
+    assert pending["status"] == "awaiting_approval"
 
 
 def test_checkpoint_survives_a_new_runner(backend):
     """A fresh runner (as after an orchestrator restart) resumes the paused run from the shared checkpointer."""
-    backend()
-    run_id, run = start()
-    assert run["status"] == "awaiting_approval"
+    _, run_id, run = start_verified(backend)
     restarted = GuardianGraphRunner(checkpointer=builder.graph_runner.checkpointer, backend="memory")
     assert restarted.interrupts(run_id) and restarted.interrupts(run_id)[0]["type"] == "approval_required"
     patch = run["remediations"][FINDINGS[0]]["patch_sha256"]
     state, interrupts = restarted.resume(run_id, {fid: {"decision": "APPROVED", "user_id": "u", "patch_sha256": patch}
                                                   for fid in FINDINGS})
-    assert interrupts == [] and state["final_report"]["pr_url"]
+    assert interrupts == [] and state["final_report"]["pr_url"] == "https://github.com/fork/pull/1"
     assert {a.decision for a in state["approvals"].values()} == {"APPROVED"}
 
 
-def test_invalid_resume_values_keep_the_run_paused(backend):
-    backend()
+def test_continue_after_restart_resumes_from_the_checkpoint(backend):
+    b = backend()
     run_id, run = start()
+    # simulate a crash right after remediation: rewind to "approval_gate is next" and mark the run cut off
+    builder.graph_runner.inject(run_id, {}, as_node="remediate")
+    main.RUN_META[run_id].update(status="error", error=main.RESTART_ERROR)
+    calls_before = len(b.calls)
+    res = client.post(f"/runs/{run_id}/continue")
+    assert res.status_code == 200 and res.json()["from"] == ["approval_gate"]
+    run = client.get(f"/runs/{run_id}").json()
+    assert run["status"] == "awaiting_approval" and run["error"] is None
+    assert not [c for c in b.calls[calls_before:] if c[0] == "stage"]  # finished nodes are not re-run
+    assert client.post(f"/runs/{run_id}/continue").status_code == 409
+
+
+def test_invalid_resume_values_keep_the_run_paused(backend):
+    _, run_id, _ = start_verified(backend)
     state, interrupts = builder.graph_runner.resume(run_id, {FINDINGS[0]: {"decision": "APPROVED", "user_id": "u",
                                                                           "patch_sha256": "f" * 64}})
     assert interrupts and state["approvals"] == {}  # wrong hash: nothing approved, still at the gate
@@ -366,6 +590,7 @@ def test_postgres_checkpointer_round_trip(backend):
     snap = fresh.snapshot(state["run_id"])
     assert isinstance(next(iter(snap["remediations"].values())), Remediation)
     patch = next(iter(snap["remediations"].values())).patch_sha256
-    final, interrupts = fresh.resume(state["run_id"], {fid: {"decision": "APPROVED", "user_id": "u",
-                                                             "patch_sha256": patch} for fid in FINDINGS})
+    assert patch
+    final, interrupts = fresh.resume(state["run_id"], {"__finish__": True, "__user__": "u"})
     assert interrupts == [] and final["final_report"]
+    assert {a.decision for a in final["approvals"].values()} == {"PENDING"}

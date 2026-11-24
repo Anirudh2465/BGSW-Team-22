@@ -3,14 +3,14 @@
 Tiers follow the rectified architecture, applied to *type-level* evidence:
 
   tier 1  a production (non-test) application class calls, instantiates, extends or implements a type
-          from the component's packages                                          -> R = 20
+          from the component's packages                                    -> M_reach = 1.0
   tier 2  the application references such a type in another way (field, method signature,
-          annotation), or only test code uses it                                  -> R = 12
+          annotation), or only test code uses it                            -> M_reach = 0.75
   None    no reference found, the class graph is missing, or the component's packages are unknown
-          or ambiguous                                                             -> R = 12 ("not determined")
+          or ambiguous                                                       -> M_reach = 0.75 ("not determined")
 
 Type-level evidence shows the application uses the library's classes, not that it reaches the
-vulnerable function, so it can only raise risk. Nothing here yields R = 0: only a completed
+vulnerable function, so it can only raise risk. Nothing here yields M_reach = 0.15: only a completed
 call-graph analysis that finds no path may lower a score, and that analysis is not run yet.
 Use through another library (log4j-api calling into log4j-core) is "not determined", never "safe".
 """

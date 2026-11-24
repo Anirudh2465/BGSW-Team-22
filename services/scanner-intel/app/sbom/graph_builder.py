@@ -19,6 +19,18 @@ from .parsers import ResolvedTree
 
 APP_NODE = "app"
 SCANNERS = ("syft", "trivy", "cdxgen")
+# Scopes that do not ship to production (same list as the risk score's M_scope = 0.35).
+NON_PRODUCTION_SCOPES = ("dev", "test", "provided", "optional")
+
+
+def merge_scope(current: str, new: str) -> str:
+    """A package used in production anywhere is a production package: a production (or unknown) scope wins
+    over dev/test/provided/optional, so the risk cap for non-production code is never applied by mistake."""
+    if not current:
+        return new or ""
+    if current in NON_PRODUCTION_SCOPES and (not new or new not in NON_PRODUCTION_SCOPES):
+        return new or "runtime"
+    return current
 
 
 @dataclass
@@ -44,8 +56,10 @@ def build_dependency_graph(trees: Iterable[ResolvedTree], scanner_sboms: Dict[st
                        ecosystem=attrs.get("type", parsed.type if parsed else ""),
                        name=attrs.get("name", ""), namespace=attrs.get("namespace", ""),
                        version=attrs.get("version", ""), scope=attrs.get("scope", ""))
-        elif attrs.get("kind") == "module":
-            g.nodes[pid]["kind"] = "module"
+        else:
+            if attrs.get("kind") == "module":
+                g.nodes[pid]["kind"] = "module"
+            g.nodes[pid]["scope"] = merge_scope(g.nodes[pid].get("scope", ""), attrs.get("scope", ""))
         sources.setdefault(pid, set()).add(source)
         if parsed:
             key_index.setdefault(parsed.key, set()).add(pid)
@@ -98,6 +112,12 @@ def build_dependency_graph(trees: Iterable[ResolvedTree], scanner_sboms: Dict[st
         data["depth"] = depths.get(node)
         data["direct"] = any(g.has_edge(m, node) for m in module_ids) if node not in module_ids else False
         data["path"] = paths.get(node, [])
+    # Exposure: how many library packages depend on this one, directly or transitively (dependency edges only).
+    library_set = {n for n, d in g.nodes(data=True) if d.get("kind") == "library"}
+    dep_graph = nx.DiGraph((u, v) for u, v, d in g.edges(data=True) if d.get("relationship") == "depends_on")
+    for node in library_set:
+        g.nodes[node]["blast_radius"] = (len(nx.ancestors(dep_graph, node) & library_set)
+                                         if dep_graph.has_node(node) else 0)
 
     library_ids = [n for n, d in g.nodes(data=True) if d.get("kind") == "library"]
     resolved_libs = [n for n in library_ids if n in resolved_ids]
@@ -134,12 +154,19 @@ def to_cyclonedx(g: nx.DiGraph, app_name: str) -> Dict[str, Any]:
                 {"name": "guardian:resolved", "value": str(data.get("resolved", False)).lower()},
             ],
         }
+        if data.get("kind") == "library":
+            # risk-score context: resolver scope, direct dependency, transitive dependents (blast radius)
+            comp["properties"] += [
+                {"name": "guardian:scope", "value": data.get("scope") or ""},
+                {"name": "guardian:direct", "value": str(bool(data.get("direct", False))).lower()},
+                {"name": "guardian:blast_radius", "value": str(int(data.get("blast_radius", 0)))},
+            ]
         if data.get("namespace") and data.get("ecosystem") == "maven":
             comp["group"] = data["namespace"]
         if data.get("version"):
             comp["version"] = data["version"]
         if data.get("scope"):
-            comp["scope"] = "optional" if data["scope"] in ("dev", "test", "optional", "provided") else "required"
+            comp["scope"] = "optional" if data["scope"] in NON_PRODUCTION_SCOPES else "required"
         components.append(comp)
 
     dependencies = []

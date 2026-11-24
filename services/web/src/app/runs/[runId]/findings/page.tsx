@@ -4,13 +4,14 @@ import React, { useEffect, useMemo, useState } from "react";
 import { Search, ShieldCheck } from "lucide-react";
 import { useRun } from "../../../../lib/run-context";
 import { EvidenceDrawer } from "../../../../components/EvidenceDrawer";
+import { FindingActions } from "../../../../components/FindingActions";
 import { Badge, Card, EmptyState, ScorePill, Segmented } from "../../../../components/ui";
 import { cn, parsePurl } from "../../../../lib/utils";
 
 type Sort = "score" | "name";
 
 export default function FindingsPage() {
-  const { run, graph, runId } = useRun();
+  const { run, graph, runId, reload } = useRun();
   const [selected, setSelected] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [kind, setKind] = useState("all");
@@ -69,12 +70,10 @@ export default function FindingsPage() {
           {list.map((f) => {
             const p = parsePurl(f.purl);
             const verdict = run.policy_verdicts?.[f.id];
+            const rem = run.remediations?.[f.id];
             return (
-              <li key={f.id}>
-                <button
-                  onClick={() => setSelected(f.id)}
-                  className={cn("flex w-full items-center gap-3 px-4 py-3 text-left transition hover:bg-white/[0.02]", selected === f.id && "bg-white/[0.04]")}
-                >
+              <li key={f.id} className={cn("transition hover:bg-white/[0.02]", selected === f.id && "bg-white/[0.04]")}>
+                <button onClick={() => setSelected(f.id)} className="flex w-full items-center gap-3 px-4 pb-1.5 pt-3 text-left">
                   <ScorePill score={f.score} />
                   <div className="min-w-0 flex-1">
                     <div className="truncate text-sm text-ink">
@@ -85,10 +84,14 @@ export default function FindingsPage() {
                       <Badge className="uppercase">{f.kind}</Badge>
                       {f.reach_tier && <Badge tone="info">tier {f.reach_tier}</Badge>}
                       {verdict && <Badge tone={verdict === "BLOCK" ? "danger" : "success"}>{verdict}</Badge>}
+                      {rem && <Badge tone={rem.state === "verified" ? "success" : rem.state === "draft" ? "warning" : "danger"}>fix {rem.state.replace(/_/g, " ")}</Badge>}
                       <span className="text-[11px] text-ink-muted">{f.evidence.length} evidence</span>
                     </div>
                   </div>
                 </button>
+                <div className="px-4 pb-3 pl-[3.25rem]">
+                  <FindingActions run={run} findingId={f.id} onChanged={reload} compact={selected !== f.id} />
+                </div>
               </li>
             );
           })}

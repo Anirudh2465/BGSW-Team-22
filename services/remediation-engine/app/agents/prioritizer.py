@@ -16,23 +16,91 @@ except Exception:
             sys.path.insert(0, _cur_dir)
         from explainer import format_detailed_finding_explanation
 
-def calculate_deterministic_risk_score(cvss: float, epss: float, kev: int, reach_tier: Optional[int], tier1_no_path: bool = False) -> int:
-    """
-    Score formula: 40 * (CVSS / 10) + 25 * EPSS + 15 * KEV + R
-    - KEV in {0, 1}, EPSS in [0, 1]
-    - R = 20 for Tier 1 call-graph path confirmed
-    - R = 0 ONLY for Tier 1 call-graph completed with no path (VEX not_affected)
-    - R = 12 for Tier 2, Tier 3, or no analysis possible
-    """
-    if reach_tier == 1:
-        r = 0 if tier1_no_path else 20
-    elif reach_tier in (2, 3):
-        r = 12
-    else:
-        r = 12
+# ---------------------------------------------------------------------------------------------------------
+# Contextual risk score (Invariant 3: pure code, no LLM, identical inputs give a bit-identical score).
+# This block is duplicated verbatim in services/scanner-intel/app/vuln/risk.py and
+# services/remediation-engine/app/agents/prioritizer.py; a parity test asserts both agree on every edge case.
+#
+#   T       = 50 * CVSS/10 + 30 * EPSS + 20 * KEV                    base threat, 0..100
+#   M_reach = 1.0   Tier 1, call path to the library confirmed
+#             0.75  Tier 2 / Tier 3 / not analysed (weaker evidence is "unknown", never "safe")
+#             0.15  Tier 1 analysis completed and found no path (VEX not_affected)
+#   M_scope = 1.0   runtime / compile / required / unknown or missing scope (fail towards risk)
+#             0.35  dev / test / provided / optional
+#   G       = (5 if direct) + min(5, blast_radius)   only while M_reach > 0.15 and M_scope == 1.0
+#   raw     = T * M_reach * M_scope + G
+#   cap     = raw <= 59 when verified unreachable or non-production: such findings never reach a BLOCK band
+#   score   = int(round(clamp(raw, 0, 100)))
+# ---------------------------------------------------------------------------------------------------------
+REACH_CONFIRMED = 1.0
+REACH_UNKNOWN = 0.75
+REACH_NO_PATH = 0.15
+SCOPE_PRODUCTION = 1.0
+SCOPE_NON_PRODUCTION = 0.35
+NON_PRODUCTION_SCOPES = frozenset({"dev", "test", "provided", "optional"})
+GRAPH_DIRECT_BONUS = 5
+GRAPH_BLAST_RADIUS_MAX = 5
+NON_BLOCKING_CAP = 59.0
 
-    raw_score = 40.0 * (cvss / 10.0) + 25.0 * epss + 15.0 * float(kev) + float(r)
-    return int(round(max(0, min(100, raw_score))))
+
+def _finite(value: Any, high: float) -> float:
+    """A finite number clamped to [0, high]; anything else (None, NaN, inf, bool, str) counts as 0.0."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.0
+    v = float(value)
+    if v != v or v in (float("inf"), float("-inf")):
+        return 0.0
+    return min(max(v, 0.0), high)
+
+
+def reach_multiplier(reach_tier: Any, tier1_no_path: bool = False) -> float:
+    if reach_tier == 1 and not isinstance(reach_tier, bool):
+        return REACH_NO_PATH if tier1_no_path is True else REACH_CONFIRMED
+    return REACH_UNKNOWN
+
+
+def scope_multiplier(scope: Any) -> float:
+    s = scope.strip().lower() if isinstance(scope, str) else ""
+    return SCOPE_NON_PRODUCTION if s in NON_PRODUCTION_SCOPES else SCOPE_PRODUCTION
+
+
+def graph_exposure(direct: Any, blast_radius: Any) -> int:
+    radius = blast_radius if isinstance(blast_radius, int) and not isinstance(blast_radius, bool) else 0
+    return (GRAPH_DIRECT_BONUS if direct is True else 0) + min(GRAPH_BLAST_RADIUS_MAX, max(radius, 0))
+
+
+def risk_breakdown(cvss: Any, epss: Any, kev: Any, reach_tier: Any, tier1_no_path: bool = False,
+                   scope: Any = None, direct: Any = False, blast_radius: Any = 0) -> Dict[str, Any]:
+    """Every term of the contextual score, for reports and explanations; ``score`` is the final value."""
+    kev_term = 1.0 if (kev == 1 and not isinstance(kev, str)) else 0.0
+    threat = 50.0 * (_finite(cvss, 10.0) / 10.0) + 30.0 * _finite(epss, 1.0) + 20.0 * kev_term
+    m_reach = reach_multiplier(reach_tier, tier1_no_path)
+    m_scope = scope_multiplier(scope)
+    unreachable = reach_tier == 1 and not isinstance(reach_tier, bool) and tier1_no_path is True
+    non_production = m_scope < SCOPE_PRODUCTION
+    g = graph_exposure(direct, blast_radius) if not unreachable and not non_production else 0
+    raw = threat * m_reach * m_scope + g
+    capped = (unreachable or non_production) and raw > NON_BLOCKING_CAP
+    if unreachable or non_production:
+        raw = min(raw, NON_BLOCKING_CAP)
+    return {
+        "threat": threat,
+        "m_reach": m_reach,
+        "m_scope": m_scope,
+        "graph_bonus": g,
+        "unreachable": unreachable,
+        "non_production": non_production,
+        "capped": capped,
+        "raw": raw,
+        "score": int(round(max(0.0, min(100.0, raw)))),
+    }
+
+
+def calculate_deterministic_risk_score(cvss: Any, epss: Any, kev: Any, reach_tier: Any, tier1_no_path: bool = False,
+                                       scope: Any = None, direct: Any = False, blast_radius: Any = 0) -> int:
+    return risk_breakdown(cvss, epss, kev, reach_tier, tier1_no_path, scope, direct, blast_radius)["score"]
+# ------------------------------------------------------------------------------------------- end of shared block
+
 
 ENRICHMENT_TOOL = "guardian-enrichment"
 ENRICHMENT_SCHEMA = "guardian.vuln-enrichment/1"
@@ -47,9 +115,10 @@ SUMMARY_LABEL = "**AI Summary (Gemini, grounded)**"
 class PrioritizerAgent:
     """Scores findings with the deterministic formula and enforces the Grounding gate.
 
-    CVE findings: CVSS, EPSS and KEV come from the enrichment artifact that scanner-intel's SBOM
-    assessment stored (referenced by the finding's ``guardian-enrichment`` evidence, by SHA-256), and
-    R comes from the reachability tier the detector attached (None = not determined -> R = 12).
+    CVE findings: CVSS, EPSS, KEV and the package-graph context (scope, direct, blast radius) come from the
+    enrichment artifact that scanner-intel's SBOM assessment stored (referenced by the finding's
+    ``guardian-enrichment`` evidence, by SHA-256); M_reach comes from the reachability tier the detector
+    attached (None = not determined -> 0.75; 0.15 only with call-graph "no path" evidence).
     Nothing is hardcoded here; values a feed could not supply ("unknown") count as 0.
     Non-CVE findings keep the fixed starting score their detector set.
     A finding that has neither cannot be scored, so the Grounding gate fails (closed).
@@ -97,10 +166,17 @@ class PrioritizerAgent:
                 epss_val = float(epss_raw) if isinstance(epss_raw, (int, float)) and not isinstance(epss_raw, bool) else 0.0
                 kev_raw = entry.get("kev")
                 kev_val = int(kev_raw) if isinstance(kev_raw, int) and not isinstance(kev_raw, bool) else 0
-                score = calculate_deterministic_risk_score(
-                    cvss=cvss_val, epss=epss_val, kev=kev_val, reach_tier=f.reach_tier, tier1_no_path=False,
+                # Verified "no path" exists only as call-graph evidence (VEX not_affected); weaker tiers never lower it.
+                no_path = f.reach_tier == 1 and any(e.tool == "reachability" and e.id.startswith("reachability:no_path")
+                                                    for e in f.evidence)
+                radius = entry.get("blast_radius")
+                breakdown = risk_breakdown(
+                    cvss=cvss_val, epss=epss_val, kev=kev_val, reach_tier=f.reach_tier, tier1_no_path=no_path,
+                    scope=entry.get("scope"), direct=entry.get("direct") is True,
+                    blast_radius=radius if isinstance(radius, int) and not isinstance(radius, bool) else 0,
                 )
-                scored.append((f, entry, score, True))
+                entry = {**entry, "score_terms": breakdown}
+                scored.append((f, entry, breakdown["score"], True))
             elif ev is not None:
                 # Enrichment evidence that cannot be read: leave unscored so Grounding fails
                 scored.append((f, None, None, False))

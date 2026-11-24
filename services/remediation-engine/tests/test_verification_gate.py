@@ -22,7 +22,7 @@ from guardian_contracts.state import Remediation
 
 from app import main as engine_main
 from app.agents.remediator import RemediatorAgent
-from app.agents.verifier import NO_TESTS_WARNING, VerifierAgent, evaluate
+from app.agents.verifier import NO_TESTS_WARNING, PREEXISTING_WARNING, VerifierAgent, evaluate
 from app.artifact_client import InMemoryArtifactClient
 
 POM = (REPO_ROOT / "tests" / "golden-repos" / "log4shell_app" / "pom.xml").read_text()
@@ -79,6 +79,18 @@ def test_no_tests_verifies_only_with_warning():
     assert r.state == "verified"
     assert r.validation["warning"] == NO_TESTS_WARNING
     assert r.validation["verification"]["warning"] == NO_TESTS_WARNING
+
+
+def test_preexisting_test_failures_verify_only_with_warning():
+    r = run(rem(stage4(tests_success=False, tests_preexisting_failures=True), rescan())).verified_remediations[0]
+    assert r.state == "verified" and r.validation["warning"] == PREEXISTING_WARNING
+    names = [c["name"] for c in r.validation["verification"]["checks"]]
+    assert "tests_no_new_failures" in names and "tests_passed" not in names
+
+
+def test_new_test_failures_are_still_a_failure():
+    r = run(rem(stage4(tests_success=False, tests_preexisting_failures=False), rescan())).verified_remediations[0]
+    assert r.state == "draft" and "tests_passed" in failed(r)
 
 
 @pytest.mark.parametrize("s4,rs,check", [

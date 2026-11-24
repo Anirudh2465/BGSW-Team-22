@@ -376,6 +376,7 @@ def _stage4_facts(resp, patch_sha: str) -> Dict[str, Any]:
         "build_success": d.get("build_success", False),
         "tests_found": d.get("tests_found", False),
         "tests_success": d.get("tests_success"),
+        "tests_preexisting_failures": d.get("tests_preexisting_failures", False),
         "tests": d.get("tests", {}),
         "resolved_version_matches": d.get("resolved_version_matches", False),
         "resolved_checks": d.get("resolved_checks", []),
@@ -519,32 +520,112 @@ def _valid_decisions(state: GuardianState, pending: List[Dict[str, Any]], decisi
 
 def approval_gate_node(state: GuardianState) -> Dict[str, Any]:
     """Human decision gate. Everything before interrupt() is pure (LangGraph re-runs the node from its start
-    on resume): no audit entry, no event, no I/O until a decision has been given."""
+    on resume): no audit entry, no event, no I/O until a human acted.
+
+    The run waits here while a verified fix has no decision or a draft fix has not been verified (verification
+    only runs when a human clicks "Verify fix"). Resume values: {finding_id: decision} for decisions, plus
+    "__finish__": true when a human chose "Finish & report" -- every fix still open is then recorded as a
+    PENDING approval (deferred: not approved, not verified) so the reporter can run."""
     from langgraph.types import interrupt
-    from .routing import pending_approvals
+    from .routing import drafts_awaiting_verification, pending_approvals
 
     pending = pending_approvals(state)
-    if not pending:
+    drafts = drafts_awaiting_verification(state)
+    if not pending and not drafts:
         gate = {"gate": "human_decision_gate", "passed": True, "pending": 0, "decided": 0,
-                "reason": "no verified remediation needs a decision"}
+                "reason": "no fix needs a decision or a verification"}
         return _record(state, "approval_gate_node", gate)
 
-    decisions = interrupt({"type": "approval_required", "run_id": state["run_id"], "pending": pending})
+    value = interrupt({"type": "approval_required", "run_id": state["run_id"], "pending": pending,
+                       "awaiting_verification": drafts})
 
     # ---- after resume: side effects are allowed from here on
+    value = value if isinstance(value, dict) else {}
+    finish = bool(value.get("__finish__"))
+    decisions = {k: v for k, v in value.items() if not k.startswith("__")}
     approvals = _valid_decisions(state, pending, decisions)
-    rejected_input = sorted(set((decisions or {}).keys() if isinstance(decisions, dict) else []) - set(approvals))
+    ignored = sorted(set(decisions) - set(approvals))
+    deferred = []
+    if finish:
+        for p in pending + drafts:
+            if p["finding_id"] not in approvals:
+                approvals[p["finding_id"]] = Approval(finding_id=p["finding_id"], decision="PENDING",
+                                                      user_id=str(value.get("__user__") or "")[:200] or None,
+                                                      patch_sha256=p["patch_sha256"])
+                deferred.append(p["finding_id"])
     still = [p["finding_id"] for p in pending if p["finding_id"] not in approvals]
-    gate = {"gate": "human_decision_gate", "passed": not still, "pending": len(still), "decided": len(approvals),
+    gate = {"gate": "human_decision_gate", "passed": not still and (finish or not drafts),
+            "pending": len(still), "decided": len(approvals) - len(deferred), "deferred": len(deferred),
+            "finished_by_user": finish,
             "decisions": {fid: {"decision": a.decision, "user_id": a.user_id, "patch_sha256": a.patch_sha256}
                           for fid, a in approvals.items()},
-            "ignored_decisions": rejected_input, "attestation": "server-attested"}
+            "ignored_decisions": ignored, "attestation": "server-attested"}
     delta = _record(state, "approval_gate_node", gate)
     delta["approvals"] = approvals
     return delta
 
 
+# --------------------------------------------------------------- confirmation run
+def confirm_source_node(state: GuardianState) -> Dict[str, Any]:
+    """Confirmation run entry (instead of clone): the patched source was built by code from the stage-1 source
+    and the approved patch; check it is stored under its hash, then run the normal pipeline on it."""
+    sha = state.get("source_sha256") or ""
+    data = artifact_store.get(sha) if sha else None
+    import hashlib as _h
+    passed = data is not None and _h.sha256(data).hexdigest() == sha
+    spec_sha = ((state.get("final_report") or {}).get("confirmation_spec_sha256"))
+    gate = {"gate": "clone_integrity_gate", "passed": passed, "mode": "confirmation",
+            "reason": None if passed else "patched source artifact missing or corrupt",
+            "spec_sha256": spec_sha}
+    return _record(state, "confirm_source_node", gate, {"stage": "clone", "artifacts": {"source": sha} if passed else {},
+                                                        "commit_sha": state.get("commit_sha")})
+
+
+def confirm_gate_node(state: GuardianState) -> Dict[str, Any]:
+    """Confirmation gate (code only): target version resolved, target advisories gone, nothing new High+."""
+    import json as _json
+    from ..confirm import evaluate
+    spec_sha = (state.get("final_report") or {}).get("confirmation_spec_sha256")
+    raw = artifact_store.get(spec_sha) if spec_sha else None
+    if raw is None:
+        result = {"passed": False, "failed": ["spec_missing"], "checks": []}
+    else:
+        result = evaluate(_json.loads(raw), state)
+    gate = {"gate": "confirmation_gate", "passed": result["passed"], "failed": result["failed"],
+            "checks": result["checks"], "spec_sha256": spec_sha}
+    delta = _record(state, "confirm_gate_node", gate)
+    delta["final_report"] = {"kind": "confirmation", "confirmation_spec_sha256": spec_sha, **result}
+    return delta
+
+
 # ---------------------------------------------------------------------- reporter
+def _open_pull_requests(state: GuardianState) -> List[Dict[str, Any]]:
+    """PRs for approved patches (idempotent per patch: an already opened PR is returned, not duplicated)."""
+    rems = state.get("remediations") or {}
+    by_patch: Dict[str, List[str]] = {}
+    who: Dict[str, str] = {}
+    for fid, a in (state.get("approvals") or {}).items():
+        rem = rems.get(fid)
+        if a.decision == "APPROVED" and rem and rem.state == "verified" and rem.patch_sha256 == a.patch_sha256:
+            by_patch.setdefault(a.patch_sha256, []).append(fid)
+            who[a.patch_sha256] = a.user_id or ""
+    out = []
+    for patch, fids in sorted(by_patch.items()):
+        rem = rems[fids[0]]
+        target = rem.candidates[rem.chosen] if rem.chosen is not None and 0 <= rem.chosen < len(rem.candidates) else ""
+        try:
+            res = service_clients.call_pull_request({
+                "run_id": state["run_id"], "repo_url": state["repo_url"], "commit_sha": state.get("commit_sha") or "",
+                "patch_sha256": patch, "finding_ids": sorted(fids), "targets": [target] if target else [],
+                "approved_by": who.get(patch, ""), "verification": {
+                    k: (rem.validation or {}).get("stage4", {}).get(k)
+                    for k in ("build_success", "tests_found", "tests_success", "resolved_version_matches")}})
+        except Exception as exc:  # noqa: BLE001 - recorded in the report, never a fake URL
+            res = {"status": "failed", "pr_url": None, "reason": f"{type(exc).__name__}: {exc}"[:300]}
+        out.append({"patch_sha256": patch, "finding_ids": sorted(fids), **res})
+    return out
+
+
 def reporter_node(state: GuardianState) -> Dict[str, Any]:
     run_id = state["run_id"]
     req = ReportRequest(
@@ -556,12 +637,16 @@ def reporter_node(state: GuardianState) -> Dict[str, Any]:
         audit_chain_head=audit_chain.get_chain_head(),
     )
     resp = service_clients.call_report(req)
-    gate_res = {"gate": "completeness_gate", "passed": resp.gate_passed, "pr_url": resp.pr_url}
+    prs = _open_pull_requests(state)
+    pr_urls = [p["pr_url"] for p in prs if p.get("pr_url")]
+    gate_res = {"gate": "completeness_gate", "passed": resp.gate_passed, "pr_url": pr_urls[0] if pr_urls else None,
+                "pull_requests": [{k: p.get(k) for k in ("patch_sha256", "status", "pr_url", "reason")} for p in prs]}
     delta = _record(state, "reporter_node", gate_res)
     delta["final_report"] = {
         "markdown_sha256": resp.markdown_report_sha256,
         "sarif_sha256": resp.sarif_report_sha256,
         "vex_sha256": resp.vex_report_sha256,
-        "pr_url": resp.pr_url,
+        "pr_url": pr_urls[0] if pr_urls else None,
+        "pull_requests": prs,
     }
     return delta

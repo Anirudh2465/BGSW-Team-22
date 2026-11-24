@@ -88,6 +88,8 @@ def enrichment_artifact(sbom_sha: str, feeds: Dict[str, Any], vulns: List[Dict[s
                 "cvss_source": v["cvss"]["source"],
                 "epss": v["epss"], "epss_status": v["epss_status"], "kev": v["kev"], "kev_status": v["kev_status"],
                 "reach_tier": v["reach_tier"], "score": v["score"], "risk_band": v["risk_band"],
+                # risk-score context the prioritizer needs to re-score with reachability (same formula)
+                "scope": v.get("scope"), "direct": v.get("direct", False), "blast_radius": v.get("blast_radius", 0),
                 "cwes": v.get("cwes", []), "weakness_category": v.get("weakness_category"), "fix": v.get("fix", {}),
                 "base_explanation": v.get("explanation"),
             }
@@ -135,7 +137,7 @@ def to_markdown(r: Dict[str, Any]) -> str:
         f"- SBOM: `{r['sbom']['sha256']}` (CycloneDX {r['sbom']['spec_version']}, {cov['total_components']} components)",
         f"- Vulnerabilities: **{s['vulnerabilities']}** ({s['confirmed']} confirmed by both tools, {s['unconfirmed']} by one), "
         f"{s['in_kev']} in CISA KEV, {s['fix_available']} with a fix",
-        f"- Risk score: `{r['method']['formula']}`, R = {r['reachability']['R']} ({r['reachability']['note']})",
+        f"- Risk score: `{r['method']['formula']}`; M_reach = {r['reachability']['M_reach']} ({r['reachability']['note']})",
         "",
         "## Tools",
         "",

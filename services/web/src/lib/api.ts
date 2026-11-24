@@ -35,6 +35,37 @@ export interface Remediation {
   state: "draft" | "verified" | "no_safe_fix" | "escalated";
 }
 
+export interface Confirmation {
+  child_run_id: string;
+  status: "queued" | "running" | "passed" | "failed";
+  finding_ids: string[];
+  user_id: string;
+  target: string;
+  started_at?: string;
+  finished_at?: string;
+  failed?: string[];
+  checks?: { name: string; passed: boolean; detail?: unknown }[];
+  pull_request?: { status: string; pr_url?: string | null; reason?: string | null };
+}
+
+export interface AssistRecord {
+  at: string;
+  user_id: string;
+  state: Remediation["state"];
+  summary?: string | null;
+  advice?: { code: string; text: string } | null;
+  decided_by?: string | null;
+  gemini_status?: string | null;
+}
+
+export interface AwaitingVerification {
+  finding_id: string;
+  patch_sha256: string;
+  target?: string | null;
+  retry_count: number;
+  previous_failed?: string[] | null;
+}
+
 /** A verified remediation waiting at the approval interrupt. */
 export interface PendingApproval {
   finding_id: string;
@@ -75,13 +106,27 @@ export interface RunData {
   remediations: Record<string, Remediation>;
   approvals: Record<string, { decision: "APPROVED" | "REJECTED" | "PENDING"; user_id?: string | null; patch_sha256?: string | null }>;
   pending_approvals?: PendingApproval[];
+  /** Draft fixes waiting for a human to click "Verify fix" (nothing is verified automatically). */
+  awaiting_verification?: AwaitingVerification[];
+  /** The patch being verified right now, if any. */
+  verifying?: { patch_sha256: string; finding_ids: string[]; user_id: string; started_at: string } | null;
+  kind?: "pipeline" | "confirmation";
+  parent_run_id?: string | null;
+  /** Confirmation runs started by "Accept", keyed by patch SHA-256. */
+  confirmations?: Record<string, Confirmation>;
+  /** "Ask Gemini" results, keyed by finding ID. */
+  assists?: Record<string, AssistRecord>;
   decisions?: Record<string, { decision: "APPROVED" | "REJECTED"; user_id: string; patch_sha256: string; at?: string }>;
   gate_results: GateResult[];
   final_report?: {
     markdown_sha256?: string;
     sarif_sha256?: string;
     vex_sha256?: string;
-    pr_url?: string;
+    pr_url?: string | null;
+    pull_requests?: { patch_sha256: string; status: string; pr_url?: string | null; reason?: string | null }[];
+    kind?: string;
+    passed?: boolean;
+    failed?: string[];
   };
   audit_chain_head: string;
   artifacts?: Record<string, RunArtifact>;
@@ -225,6 +270,8 @@ export interface RunSummary {
   commit_sha: string;
   findings_count: number;
   final_report?: RunData["final_report"] | null;
+  kind?: "pipeline" | "confirmation";
+  parent_run_id?: string | null;
 }
 
 export interface RunEventRecord {
@@ -298,6 +345,41 @@ export const approvePatch = (
     method: "POST",
     body: JSON.stringify({ finding_id: findingId, decision, user_id: userId, patch_sha256: patchSha256 }),
   });
+
+/** Accept a verified fix: re-runs the whole pipeline on the patched source; approval + PR only if it passes. */
+export const acceptFix = (runId: string, findingId: string, patchSha256: string, userId = "dashboard-user") =>
+  request<{ status: "started" | "already_running"; confirmation: Confirmation }>(
+    `/runs/${encodeURIComponent(runId)}/remediations/${encodeURIComponent(findingId)}/accept`,
+    { method: "POST", body: JSON.stringify({ user_id: userId, patch_sha256: patchSha256 }) },
+  );
+
+/** Verify one draft fix in the sandbox (build, tests, re-resolve, rescan) -- only on this explicit request. */
+export const verifyFix = (runId: string, findingId: string, userId = "dashboard-user") =>
+  request<{ status: string; patch_sha256: string; finding_ids: string[] }>(
+    `/runs/${encodeURIComponent(runId)}/remediations/${encodeURIComponent(findingId)}/verify`,
+    { method: "POST", body: JSON.stringify({ user_id: userId }) },
+  );
+
+/** Close a paused run: unverified / undecided fixes are recorded as deferred and the reports are written. */
+export const finishRun = (runId: string, userId = "dashboard-user") =>
+  request<{ status: string }>(`/runs/${encodeURIComponent(runId)}/finish`, { method: "POST", body: JSON.stringify({ user_id: userId }) });
+
+/** Ask Gemini to remediate one finding (code-built candidates; Gemini picks and explains; then verify). */
+export const askGemini = (runId: string, findingId: string, userId = "dashboard-user") =>
+  request<{ status: string; remediation: Remediation; assist: Record<string, unknown> }>(
+    `/runs/${encodeURIComponent(runId)}/findings/${encodeURIComponent(findingId)}/ask-ai`,
+    { method: "POST", body: JSON.stringify({ user_id: userId }) },
+  );
+
+/** One sandbox step's log (secrets scrubbed) from a verification bundle of this run. */
+export async function fetchVerifyLog(runId: string, bundleSha256: string, step: string): Promise<string> {
+  const res = await fetch(
+    `${ORCHESTRATOR_URL}/runs/${encodeURIComponent(runId)}/verify-log/${encodeURIComponent(bundleSha256)}/${encodeURIComponent(step)}`,
+    { cache: "no-store" },
+  );
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return res.text();
+}
 
 /** The exact patch (unified diff) a remediation refers to, by its SHA-256. */
 export async function fetchPatch(runId: string, patchSha256: string): Promise<string> {

@@ -340,6 +340,7 @@ def test_bundle_contents_and_proxy_wiring(store):
     assert call["egress"].allowlist_port and call["egress"].sinkhole_port is None  # allowlist only, no sinkhole
     assert call["timeout_s"] == s4.VERIFY_TIMEOUT_S == 600
     assert call["env"]["GUARDIAN_MAVEN_PLUGIN"].endswith("maven-dependency-plugin:3.8.1:tree")
+    assert "tar -xzmf -" in call["script"]  # current mtimes: builds break on the tarball's mtime 0
     inputs = read_members(call["input_tar"])
     assert inputs["patch.diff"] == POM_PATCH and "src/pom.xml" in inputs
     assert res["metrics"]["blocked_hosts"] == []
@@ -425,3 +426,75 @@ def test_real_docker_log4shell_verify(store, monkeypatch):
     assert res["build_success"] is True and res["tests_found"] is False
     assert res["resolved_version_matches"] is True
     assert "sbom/syft.cdx.json" in bundle_of(store, res)
+
+
+# --------------------------------------------------------------------------- baseline (pre-existing failures)
+def surefire_cases(*failing, passing=("AppTest#ok",)):
+    cases = "".join(f'<testcase classname="{c.split("#")[0]}" name="{c.split("#")[1]}"/>' for c in passing)
+    cases += "".join(f'<testcase classname="{c.split("#")[0]}" name="{c.split("#")[1]}"><error message="x"/></testcase>'
+                     for c in failing)
+    n = len(passing) + len(failing)
+    return (f'<?xml version="1.0"?><testsuite name="s" tests="{n}" failures="0" errors="{len(failing)}" '
+            f'skipped="0">{cases}</testsuite>').encode()
+
+
+def maven_with_baseline(patched_failing, base_failing, base_rc):
+    rows = [*MAVEN_OK, ("maven.test.root", 1, 9.0), ("baseline.revert", 0, 0.1), ("maven.basetest.root", base_rc, 9.0)]
+    out = {"steps.txt": steps(*rows), "resolved/maven/root.json": maven_tree("2.25.4"), "sbom/syft.cdx.json": SBOM,
+           "tests/maven/root/TEST-AppTest.xml": surefire_cases(*patched_failing)}
+    out["baseline/maven/root/TEST-AppTest.xml"] = surefire_cases(*base_failing)
+    return FakeRunner(out)
+
+
+def test_failures_that_also_happen_without_the_patch_do_not_block(store):
+    # e.g. a Spring context test that needs a MySQL server the sandbox does not have
+    runner = maven_with_baseline(["AppTest#contextLoads"], ["AppTest#contextLoads"], 1)
+    res = verify(store, runner, maven_source(store, tests=True))
+    assert res["status"] == "success"
+    assert res["tests_success"] is False and res["tests_preexisting_failures"] is True
+    base = res["tests"]["maven"]["baseline"]
+    assert base["compared_by"] == "test_case" and base["new_failures"] == [] and base["preexisting_only"] is True
+    assert res["error"] is None
+    assert "baseline/maven/root/TEST-AppTest.xml" in bundle_of(store, res)
+
+
+def test_baseline_passing_means_the_patch_broke_the_tests(store):
+    runner = maven_with_baseline(["AppTest#contextLoads"], [], 0)
+    res = verify(store, runner, maven_source(store, tests=True))
+    assert res["status"] == "failure" and res["tests_preexisting_failures"] is False
+    assert res["tests"]["maven"]["baseline"]["new_failures"] == ["AppTest#contextLoads"]
+    assert "1 new failing test" in res["error"]
+
+
+def test_one_new_failure_on_top_of_old_ones_blocks(store):
+    runner = maven_with_baseline(["AppTest#contextLoads", "AppTest#parsesYaml"], ["AppTest#contextLoads"], 1)
+    res = verify(store, runner, maven_source(store, tests=True))
+    assert res["status"] == "failure"
+    assert res["tests"]["maven"]["baseline"]["new_failures"] == ["AppTest#parsesYaml"]
+
+
+def test_npm_baseline_is_compared_by_exit_code(store):
+    source = put_source(store, {"package.json": PKG})
+    rows = steps(("patch.check", 0, 0.1), ("patch.apply", 0, 0.1), ("sbom.syft", 0, 1), ("npm.lock.root", 0, 3),
+                 ("npm.build.root", 0, 9), ("npm.resolve.root", 0, 1), ("npm.test.root", 1, 5),
+                 ("baseline.revert", 0, 0.1), ("npm.baselock.root", 0, 2), ("npm.basebuild.root", 0, 5),
+                 ("npm.basetest.root", 1, 5))
+    runner = FakeRunner({"steps.txt": rows, "resolved/npm/root.json": NPM_LS, "sbom/syft.cdx.json": SBOM})
+    res = verify(store, runner, source, patch=NPM_PATCH, targets=("pkg:npm/lodash@4.17.21",))
+    assert res["status"] == "success" and res["tests_preexisting_failures"] is True
+    assert res["tests"]["npm:."]["baseline"]["compared_by"] == "exit_code"
+
+
+def test_baseline_that_did_not_run_does_not_excuse_failures(store):
+    rows = steps(*MAVEN_OK, ("maven.test.root", 1, 9.0), ("baseline.revert", 1, 0.1))
+    runner = FakeRunner({"steps.txt": rows, "resolved/maven/root.json": maven_tree("2.25.4"), "sbom/syft.cdx.json": SBOM,
+                         "tests/maven/root/TEST-AppTest.xml": surefire_cases("AppTest#contextLoads")})
+    res = verify(store, runner, maven_source(store, tests=True))
+    assert res["status"] == "failure" and res["tests_preexisting_failures"] is False
+
+
+def test_script_runs_the_baseline_only_after_a_test_failure():
+    from app.stages.stage4_verify import VERIFY_SCRIPT, junit_failing
+    assert 'if [ -n "$FAILED_TESTS" ]' in VERIFY_SCRIPT and "baseline.revert $REVERT" in VERIFY_SCRIPT
+    assert 'REVERT="git apply -R -v $PATCH"' in VERIFY_SCRIPT and "npm.basetest" in VERIFY_SCRIPT
+    assert junit_failing({"a": surefire_cases("A#x", "B#y")}) == ["A#x", "B#y"]

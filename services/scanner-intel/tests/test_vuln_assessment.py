@@ -91,7 +91,10 @@ def test_log4shell_found_confirmed_kev_and_scored(result):
     assert v["cvss"]["score"] == 10.0 and v["cvss"]["version"] == "3.1" and v["cvss"]["source"] == "vector"
     epss = v["epss"]
     assert isinstance(epss, float) and 0.9 < epss <= 1.0
-    assert v["score"] == round(40 + 25 * epss + 15 + 12)
+    # contextual formula, reachability unknown from an SBOM: (50*CVSS/10 + 30*EPSS + 20*KEV) * 0.75 + G
+    g = (5 if v["direct"] else 0) + min(5, v["blast_radius"])
+    assert v["score"] == round((50 + 30 * epss + 20) * 0.75 + g)
+    assert v["score_terms"]["m_reach"] == 0.75 and v["score_terms"]["m_scope"] == 1.0
     assert v["risk_band"] == risk_band(v["score"]) and v["risk_band"] in ("Critical", "High")
     assert v["reach_tier"] is None
     assert v["weakness_category"] == "Remote code execution / injection" and "CWE-917" in v["cwes"]
@@ -154,7 +157,8 @@ def test_feed_outage_marks_unknown_and_still_scores(tmp_path):
     assert r["feeds"]["epss"]["status"] == "unavailable" and r["feeds"]["kev"]["status"] == "unavailable"
     [v] = vulns_of(r, LOG4J, "CVE-2021-44228")
     assert v["epss"] == "unknown" and v["kev"] == "unknown"
-    assert v["score"] == round(40 + 0 + 0 + 12)
+    g = (5 if v["direct"] else 0) + min(5, v["blast_radius"])
+    assert v["score"] == round(50 * 0.75 + g)  # unknown EPSS / KEV count as 0
     assert len(r["vulnerabilities"]) == 67  # nothing dropped
     assert "EPSS unknown" in v["explanation"] and "KEV unknown" in v["explanation"]
     assert any("EPSS feed unavailable" in n for n in r["notes"])
@@ -223,26 +227,85 @@ def test_same_input_twice_gives_byte_identical_report(tmp_path):
 
 
 # 10 --------------------------------------------------------------------------------------------
-def _remediation_formula():
+def _remediation_module():
     path = REPO_ROOT / "services" / "remediation-engine" / "app" / "agents" / "prioritizer.py"
     spec = importlib.util.spec_from_file_location("remediation_prioritizer_for_vuln_test", path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    return mod.calculate_deterministic_risk_score
+    return mod
 
 
-def test_risk_formula_matches_remediation_engine_on_20_inputs():
-    theirs = _remediation_formula()
-    inputs = [
-        (10.0, 0.99999, 1, None, False), (10.0, 0.97, 1, 1, False), (10.0, 0.0, 0, 1, True), (9.8, 0.27, 0, None, False),
-        (0.0, 0.0, 0, None, False), (0.0, 0.0, 0, 1, True), (5.3, 0.001, 0, 2, False), (7.5, 0.4, 0, 3, False),
-        (6.1, 0.5, 1, None, False), (4.4, 0.03, 0, 2, False), (8.8, 1.0, 1, 1, False), (3.1, 0.25, 0, None, False),
-        (9.0, 0.995, 1, None, False), (6.6, 0.98, 0, None, False), (5.9, 0.999, 0, 3, False), (2.0, 0.02, 0, 1, False),
-        (7.0, 0.5, 0, None, False), (10.0, 1.0, 1, 1, False), (1.0, 0.0, 0, 2, False), (9.99, 0.123, 1, 3, False),
-    ]
-    assert len(inputs) == 20
-    for args in inputs:
-        assert calculate_deterministic_risk_score(*args) == theirs(*args), args
+def _shared_block(text: str) -> str:
+    return text[text.index("# Contextual risk score"):text.index("end of shared block")]
+
+
+def test_risk_formula_source_is_identical_in_both_services():
+    ours = (SERVICE_DIR / "app" / "vuln" / "risk.py").read_text(encoding="utf-8")
+    theirs = (REPO_ROOT / "services" / "remediation-engine" / "app" / "agents" / "prioritizer.py").read_text(encoding="utf-8")
+    assert _shared_block(ours) == _shared_block(theirs)
+
+
+def _same(a, b) -> bool:
+    """Equal, and bit-identical for floats (NaN-safe, -0.0 vs 0.0 distinguished)."""
+    import struct
+    if isinstance(a, float) and isinstance(b, float):
+        return struct.pack(">d", a) == struct.pack(">d", b)
+    return type(a) is type(b) and a == b
+
+
+def test_risk_formula_matches_remediation_engine_on_every_edge_case():
+    """Both implementations give the same score and the same bits for every term, over a grid that includes
+    garbage inputs (NaN, inf, None, bools, strings, negatives, out-of-range values, odd scope spellings)."""
+    import itertools
+    theirs = _remediation_module()
+    from app.vuln import risk as ours
+    nan, inf = float("nan"), float("inf")
+    cvss = [0.0, 2.1, 5.0, 7.5, 9.8, 10.0, 11.0, -1.0, nan, inf, None, True, "9.8", 7]
+    epss = [0.0, 0.001, 0.5, 0.97, 1.0, 1.5, -0.2, nan, None, False]
+    kev = [0, 1, True, False, 2, "1", None, 1.0]
+    reach = [(None, False), (1, False), (1, True), (2, False), (3, False), (2, True), (None, True), (True, False)]
+    scope = [None, "", "runtime", "compile", "required", "dev", "TEST", " provided ", "optional", "excluded", 3]
+    exposure = [(False, 0), (True, 0), (True, 3), (False, 9), (True, -4), ("true", 2), (1, 1), (True, True), (False, "3"),
+                (True, 2.5)]
+    count = 0
+    for c, e, k, (tier, no_path), sc, (direct, radius) in itertools.product(cvss, epss, kev, reach, scope, exposure):
+        a = ours.risk_breakdown(c, e, k, tier, no_path, sc, direct, radius)
+        b = theirs.risk_breakdown(c, e, k, tier, no_path, sc, direct, radius)
+        assert a.keys() == b.keys() and all(_same(a[x], b[x]) for x in a), (c, e, k, tier, no_path, sc, direct, radius)
+        assert ours.calculate_deterministic_risk_score(c, e, k, tier, no_path, sc, direct, radius) ==             theirs.calculate_deterministic_risk_score(c, e, k, tier, no_path, sc, direct, radius) == a["score"]
+        assert 0 <= a["score"] <= 100 and isinstance(a["score"], int)
+        if a["unreachable"] or a["non_production"]:
+            assert a["score"] <= 59 and a["graph_bonus"] == 0
+        count += 1
+    assert count > 100_000 // 10
+
+
+@pytest.mark.parametrize("args,expected", [
+    # (cvss, epss, kev, reach_tier, tier1_no_path, scope, direct, blast_radius) -> score
+    ((10.0, 0.97, 1, 1, False, None, False, 0), 99),       # T = 99.1, tier 1 confirmed, production
+    ((10.0, 0.97, 1, None, False, None, False, 0), 74),    # 99.1 * 0.75 (SBOM only / not analysed)
+    ((10.0, 0.97, 1, 2, False, None, False, 0), 74),       # tier 2 = unknown
+    ((10.0, 0.97, 1, 1, True, None, True, 5), 15),         # verified no path: 99.1 * 0.15, no graph bonus
+    ((10.0, 1.0, 1, 1, False, "test", True, 5), 35),       # dev/test: 100 * 0.35, no graph bonus
+    ((10.0, 1.0, 1, 1, False, "required", True, 9), 100),  # 100 + 5 + 5, clamped
+    ((5.0, 0.0, 0, None, False, "runtime", True, 3), 27),  # 25 * 0.75 + 5 + 3 = 26.75
+    ((0.0, 0.0, 0, None, False, None, False, 99), 5),      # blast radius bonus caps at 5
+    ((8.5, 0.65, 0, 1, False, None, False, 0), 62),        # 42.5 + 19.5
+    ((8.5, 0.70, 0, 2, False, None, False, 0), 48),        # 63.5 * 0.75 = 47.625
+    ((float("nan"), None, "1", True, False, 7, "true", "3"), 0),  # garbage counts as nothing
+])
+def test_risk_formula_values(args, expected):
+    from app.vuln.risk import calculate_deterministic_risk_score as score
+    assert score(*args) == expected
+
+
+def test_non_production_and_unreachable_never_reach_a_block_band():
+    from app.vuln.risk import risk_breakdown
+    for scope in ("dev", "test", "provided", "optional"):
+        b = risk_breakdown(10.0, 1.0, 1, 1, False, scope, True, 100)
+        assert b["score"] <= 59 and b["graph_bonus"] == 0 and b["non_production"] is True
+    b = risk_breakdown(10.0, 1.0, 1, 1, True, "runtime", True, 100)
+    assert b["score"] <= 59 and b["unreachable"] is True and b["graph_bonus"] == 0
 
 
 # ------------------------------------------------------------------------------- report / CLI / API
@@ -254,7 +317,8 @@ def test_report_structure_and_markdown(result):
     scores = [v["score"] for v in r["vulnerabilities"]]
     assert scores == sorted(scores, reverse=True)
     assert sum(r["summary"]["by_risk_band"].values()) == len(r["vulnerabilities"]) == 67
-    assert r["reachability"] == {"analysed": False, "reach_tier": None, "R": 12, "note": "not analysed, SBOM only"}
+    assert r["reachability"] == {"analysed": False, "reach_tier": None, "M_reach": 0.75, "note": "not analysed, SBOM only"}
+    assert "M_reach" in result.report_md and "T = 50*CVSS/10 + 30*EPSS + 20*KEV" in r["method"]["formula"]
     md = result.report_md
     assert "## By risk band" in md and "## By weakness category" in md and "| CVE-2021-44228 |" in md
     enrichment = json.loads(result.enrichment_json)

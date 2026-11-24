@@ -28,8 +28,9 @@
       "commit_sha": "feed01234567890abcdef1234567890abcdef12",
       "ecosystem": "pypi",
       "expected_vulnerabilities": ["CVE-2023-32681"],
-      "expected_policy_verdict": "BLOCK",
-      "expected_fix_version": "2.31.0"
+      "expected_policy_verdict": "PASS",
+      "expected_fix_version": "2.31.0",
+      "verdict_note": "Contextual risk score: CVSS 8.5, EPSS 0.70, not in KEV, reachability tier 2, direct runtime dependency -> (42.5 + 21) * 0.75 + 5 = 53 (Medium, PASS with warning). The old flat formula gave 64 (BLOCK)."
     },
     {
       "id": "clean-microservice",

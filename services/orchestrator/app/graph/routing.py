@@ -50,15 +50,39 @@ def should_retry_remediation(state: GuardianState) -> Literal["retry", "approval
     return "approval_gate"
 
 
+def _settled(state: GuardianState, fid: str, rem: Remediation) -> bool:
+    """A decision exists for this exact patch: APPROVED / REJECTED, or PENDING = deferred by "Finish & report"."""
+    a = (state.get("approvals") or {}).get(fid)
+    return a is not None and a.patch_sha256 == rem.patch_sha256
+
+
+def drafts_awaiting_verification(state: GuardianState) -> List[Dict[str, Any]]:
+    """Draft fixes with a patch that a human has not had verified yet. Verification runs only on request
+    (the "Verify fix" button), never automatically. Pure: safe before interrupt()."""
+    out = []
+    for fid, rem in sorted((state.get("remediations") or {}).items()):
+        if rem.state != "draft" or not rem.patch_sha256 or _settled(state, fid, rem):
+            continue
+        v = rem.validation or {}
+        out.append({
+            "finding_id": fid,
+            "patch_sha256": rem.patch_sha256,
+            "target": rem.candidates[rem.chosen] if rem.chosen is not None and 0 <= rem.chosen < len(rem.candidates)
+            else None,
+            "retry_count": rem.retry_count,
+            "previous_failed": ((v.get("attempts") or [{}])[-1].get("verification") or {}).get("failed")
+            if v.get("attempts") else None,
+        })
+    return out
+
+
 def pending_approvals(state: GuardianState) -> List[Dict[str, Any]]:
     """Verified remediations that still need a human decision (pure: safe before interrupt())."""
-    approvals = state.get("approvals") or {}
     out = []
     for fid, rem in sorted((state.get("remediations") or {}).items()):
         if rem.state != "verified" or not rem.patch_sha256:
             continue
-        a = approvals.get(fid)
-        if a is not None and a.decision in ("APPROVED", "REJECTED") and a.patch_sha256 == rem.patch_sha256:
+        if _settled(state, fid, rem):
             continue
         v = rem.validation or {}
         out.append({
@@ -77,6 +101,12 @@ def should_pause_for_approval(state: GuardianState) -> bool:
     return bool(pending_approvals(state))
 
 
+def needs_human(state: GuardianState) -> bool:
+    """The run waits while a verified fix lacks a decision or a draft fix has not been verified on request."""
+    return bool(pending_approvals(state)) or bool(drafts_awaiting_verification(state))
+
+
 def route_after_approval(state: GuardianState) -> Literal["approval_gate", "reporter"]:
-    """Human decision gate: no timeout -- a pending decision keeps the run at the approval interrupt."""
-    return "approval_gate" if should_pause_for_approval(state) else "reporter"
+    """Human decision gate: no timeout -- the run stays at the interrupt until every fix is decided, or a
+    human chooses "Finish & report" (which records the rest as deferred)."""
+    return "approval_gate" if needs_human(state) else "reporter"

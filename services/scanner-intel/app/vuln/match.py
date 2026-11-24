@@ -11,7 +11,7 @@ tools report it and "unconfirmed" when only one does; both kinds are kept.
 
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Set, Any, Dict, Iterable, List, Optional, Tuple
 
 from ..sbom import purl as P
 from ..sbom.parsers import parse_cyclonedx
@@ -27,6 +27,10 @@ class SbomComponent:
     version: str
     ecosystem: str
     path: List[str]
+    # risk-score context from the package graph (defaults: unknown scope = production, not direct, no dependents)
+    scope: str = ""
+    direct: bool = False
+    blast_radius: int = 0
 
 
 @dataclass
@@ -81,9 +85,11 @@ def load_sbom(data: Dict[str, Any]) -> Tuple[Dict[str, SbomComponent], Dict[str,
             unchecked.append({"component": label, "reason": "no version"})
 
     paths = _paths(data, meta_ref, ref_to_purl)
+    context = _context(data, meta_ref, ref_to_purl)
     components = {
         key: SbomComponent(purl=key, name=f"{p.namespace}/{p.name}" if p.namespace and p.type == "npm" else p.name,
-                           version=p.version, ecosystem=p.type, path=paths.get(key) or [APP, key])
+                           version=p.version, ecosystem=p.type, path=paths.get(key) or [APP, key],
+                           **context.get(key, {}))
         for key, p in sorted(parsed.items()) if p.version
     }
     coverage = {
@@ -116,6 +122,55 @@ def _paths(data: Dict[str, Any], root_ref: Optional[str], ref_to_purl: Dict[str,
             key = ref_to_purl.get(child, child)
             out.setdefault(key, path + [key])
             queue.append((child, path + [key]))
+    return out
+
+
+def _context(data: Dict[str, Any], root_ref: Optional[str], ref_to_purl: Dict[str, str]) -> Dict[str, Dict[str, Any]]:
+    """Per component: scope, direct, blast_radius.
+
+    Guardian's merged SBOM carries them as ``guardian:scope`` / ``guardian:direct`` / ``guardian:blast_radius``
+    (computed on the package graph). For any other CycloneDX SBOM they are derived from the SBOM itself with
+    the same definitions: scope from the CycloneDX ``scope`` field; direct = depended on by the root or by an
+    application (module) component; blast radius = library components that depend on it, directly or
+    transitively."""
+    comps = [c for c in _walk(data.get("components") or []) if isinstance(c, dict)]
+    kinds = {c.get("bom-ref"): c.get("type") for c in comps if c.get("bom-ref")}
+    parents: Dict[str, Set[str]] = {}
+    for d in data.get("dependencies") or []:
+        for child in d.get("dependsOn") or []:
+            parents.setdefault(child, set()).add(d.get("ref"))
+
+    def ancestors(ref: str) -> Set[str]:
+        seen: Set[str] = set()
+        stack = list(parents.get(ref, ()))
+        while stack:
+            r = stack.pop()
+            if r in seen:
+                continue
+            seen.add(r)
+            stack.extend(parents.get(r, ()))
+        return seen
+
+    out: Dict[str, Dict[str, Any]] = {}
+    for c in comps:
+        p = P.parse(c.get("purl", ""))
+        if not p:
+            continue
+        props = {x.get("name"): x.get("value") for x in c.get("properties") or [] if isinstance(x, dict)}
+        ref = c.get("bom-ref")
+        if "guardian:direct" in props:
+            try:
+                radius = int(props.get("guardian:blast_radius") or 0)
+            except ValueError:
+                radius = 0
+            ctx = {"scope": props.get("guardian:scope") or c.get("scope") or "",
+                   "direct": props.get("guardian:direct") == "true", "blast_radius": max(radius, 0)}
+        else:
+            ups = parents.get(ref, set()) if ref else set()
+            ctx = {"scope": c.get("scope") or "",
+                   "direct": any(u == root_ref or kinds.get(u) == "application" for u in ups),
+                   "blast_radius": sum(1 for a in ancestors(ref) if kinds.get(a) == "library") if ref else 0}
+        out[str(p)] = ctx
     return out
 
 

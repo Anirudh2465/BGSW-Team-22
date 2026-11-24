@@ -73,6 +73,11 @@ def build_facts(f: Finding, entry: Optional[Dict[str, Any]], score: Optional[int
         facts["in_cisa_kev"] = entry.get("kev") == 1
         fix = entry.get("fix") or {}
         facts["fixed_version"] = _safe(fix.get("lowest_fixed_version")) if isinstance(fix, dict) else None
+        scope = entry.get("scope")
+        facts["dependency_scope"] = scope if isinstance(scope, str) and re.match(r"^[a-z]{1,20}$", scope) else None
+        facts["direct_dependency"] = entry.get("direct") is True
+        radius = entry.get("blast_radius")
+        facts["dependent_packages"] = radius if isinstance(radius, int) and not isinstance(radius, bool) else None
         cat = entry.get("weakness_category")
         facts["weakness_category"] = _safe(cat)
         facts["cwes"] = [c for c in entry.get("cwes") or [] if isinstance(c, str) and re.match(r"^CWE-\d+$", c)][:5]

@@ -193,6 +193,23 @@ def parse_cvss_vector_summary(vector: Optional[str]) -> str:
     return "; ".join(parts) if parts else "CVSS v3 verified vector"
 
 
+def _context_lines(entry: Optional[Dict[str, Any]]) -> str:
+    """Scope, graph exposure and the score's terms (from the deterministic breakdown), one line each."""
+    terms = entry.get("score_terms") if isinstance(entry, dict) else None
+    if not isinstance(terms, dict):
+        return ""
+    scope = entry.get("scope") or "unknown (treated as production)"
+    direct = "direct dependency" if entry.get("direct") is True else "transitive dependency"
+    radius = entry.get("blast_radius") if isinstance(entry.get("blast_radius"), int) else 0
+    capped = " (capped at 59: unreachable or non-production code never blocks)" if terms.get("capped") else ""
+    return (
+        f"  - Dependency Scope: {scope} (multiplier {terms.get('m_scope')})\n"
+        f"  - Graph Exposure: {direct}, {radius} package(s) depend on it (+{terms.get('graph_bonus')} points)\n"
+        f"  - Score Breakdown: threat {round(terms.get('threat', 0.0), 2)} x reach {terms.get('m_reach')} "
+        f"x scope {terms.get('m_scope')} + exposure {terms.get('graph_bonus')}{capped}\n"
+    )
+
+
 def format_detailed_finding_explanation(
     f: Finding,
     entry: Optional[Dict[str, Any]] = None,
@@ -338,16 +355,17 @@ def format_detailed_finding_explanation(
     elif effective_reach == 1:
         reach_desc = ("Tier 1 (Application Uses This Library) — application code calls or instantiates classes of "
                       "this library (type-level class-graph evidence; the vulnerable function itself was not traced). "
-                      "Risk raised: R = 20." + reach_detail)
+                      "Reachability multiplier 1.0 (full threat counted)." + reach_detail)
     elif effective_reach == 2:
         reach_desc = ("Tier 2 (Referenced) — application code references this library's types but no call was "
-                      "found, or only tests use it. Neutral: R = 12." + reach_detail)
+                      "found, or only tests use it. Reachability multiplier 0.75 (unknown, not safe)." + reach_detail)
     elif effective_reach == 3:
-        reach_desc = "Tier 3 (Mentioned) — the library is only mentioned in the code. Neutral: R = 12."
+        reach_desc = ("Tier 3 (Mentioned) — the library is only mentioned in the code. "
+                      "Reachability multiplier 0.75 (unknown, not safe).")
     else:
         reach_desc = ("Not Determined — no direct use found in the class graph, or no class graph for this "
                       "ecosystem. It may still be used through another library; this does NOT mean safe. "
-                      "Neutral: R = 12.")
+                      "Reachability multiplier 0.75 (unknown, not safe).")
 
     evidence_summary = ", ".join(f"{e.tool}:{e.id}" for e in f.evidence) or "N/A"
 
@@ -360,6 +378,7 @@ def format_detailed_finding_explanation(
         f"  - EPSS Exploit Probability: {round(epss * 100, 1)}% in-the-wild exploitation likelihood\n"
         f"  - CISA KEV Catalog: {'Listed (Actively Weaponized in the Wild)' if kev else 'Not currently listed'}\n"
         f"  - Reachability Analysis: {reach_desc}\n"
+        f"{_context_lines(entry)}"
         f"• **Dependency Call Path**: `{path_str}`\n"
         f"• **Recommended Action**: {remediation}\n"
         f"• **Grounded Evidence**: {evidence_summary}"

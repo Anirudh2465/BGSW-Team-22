@@ -33,7 +33,7 @@ def test_score_formula():
     assert score >= 97
 
     score_no_path = calculate_deterministic_risk_score(10.0, 0.0, 0, 1, tier1_no_path=True)
-    assert score_no_path == 40
+    assert score_no_path == 8   # T = 50, verified no path: 50 * 0.15 = 7.5 -> 8
 
 def test_policy_evaluation():
     agent = PolicyAgent()
@@ -61,6 +61,11 @@ def test_remediation_engine_pipeline_api(monkeypatch):
     import httpx as _httpx
     from app import artifact_client as _ac
     from app import main as _main
+    if not hasattr(_main, "remediator_agent"):
+        import importlib.util
+        _spec = importlib.util.spec_from_file_location("remediation_engine_main_fix", SERVICE_DIR / "app" / "main.py")
+        _main = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_main)
     from app.artifact_client import InMemoryArtifactClient as _Mem
     from app.remediation.registry import VersionRegistry as _Reg
 
@@ -143,7 +148,8 @@ def test_remediation_engine_pipeline_api(monkeypatch):
     assert rep_res.status_code == 200
     data = rep_res.json()
     assert data["gate_passed"] is True
-    assert data["pr_url"] is not None
+    # the report never invents a PR: PRs come from POST /pull-request (writer App) after a confirmed approval
+    assert data["pr_url"] is None
 
 
 # ------------------------------------------------------- prioritizer reads the enrichment artifact
@@ -174,12 +180,35 @@ def test_prioritizer_scores_cves_from_the_enrichment_artifact():
     res = agent.prioritize_findings("r1", [_cve("a", sha), _cve("b", sha), _cve("c", sha), _cve("a", sha, reach_tier=1)])
     scores = [f.score for f in res.prioritized_findings]
     assert scores == [
-        calculate_deterministic_risk_score(10.0, 0.99999, 1, None),  # 92: R = 12, reachability unknown
+        calculate_deterministic_risk_score(10.0, 0.99999, 1, None),  # 75: reachability unknown, M_reach 0.75
         calculate_deterministic_risk_score(9.8, 0.0, 0, None),
         calculate_deterministic_risk_score(0.0, 0.0, 0, None),
-        calculate_deterministic_risk_score(10.0, 0.99999, 1, 1),     # tier 1 path confirmed: R = 20
+        calculate_deterministic_risk_score(10.0, 0.99999, 1, 1),     # tier 1 path confirmed: M_reach 1.0
     ]
-    assert scores[0] == 92 and res.gate_passed is True
+    assert scores == [75, 37, 0, 100] and res.gate_passed is True
+
+
+def test_prioritizer_uses_scope_graph_exposure_and_no_path_evidence():
+    store = InMemoryArtifactClient()
+    sha = _enrichment(store, {
+        "prod": {"cvss_score": 9.8, "epss": 0.5, "kev": 0, "scope": "compile", "direct": True, "blast_radius": 7},
+        "test": {"cvss_score": 10.0, "epss": 1.0, "kev": 1, "scope": "test", "direct": True, "blast_radius": 7},
+        "old": {"cvss_score": 9.8, "epss": 0.5, "kev": 0},           # enrichment written before the new fields
+        "bad": {"cvss_score": 9.8, "epss": 0.5, "kev": 0, "scope": 5, "direct": "yes", "blast_radius": "9"},
+    })
+    no_path = _cve("prod", sha, reach_tier=1)
+    no_path = no_path.model_copy(update={"evidence": list(no_path.evidence) + [
+        Evidence(id="reachability:no_path:LogConfig", tool="reachability", artifact_sha256="g" * 64)]})
+    agent = PrioritizerAgent(artifacts=store)
+    res = agent.prioritize_findings("r1", [_cve("prod", sha), _cve("test", sha, reach_tier=1), _cve("old", sha),
+                                           _cve("bad", sha), no_path])
+    s = [f.score for f in res.prioritized_findings]
+    # prod: (49 + 15) * 0.75 + 5 + 5 = 58 ; test-scoped: 100 * 0.35 = 35, no bonus, never BLOCK
+    assert s[0] == 58 and s[1] == 35
+    assert s[2] == 48 and s[3] == 48                 # missing / malformed context: production, no bonus
+    assert s[4] == round(64 * 0.15)                   # call-graph "no path" evidence -> M_reach 0.15, no bonus
+    assert "Score Breakdown" in res.prioritized_findings[1].explanation
+    assert "multiplier 0.35" in res.prioritized_findings[1].explanation
 
 
 def test_prioritizer_keeps_non_cve_scores_and_fails_closed_without_enrichment():

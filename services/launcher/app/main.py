@@ -132,6 +132,7 @@ def run_stage(req: StageRunRequest):
                     "build_success": res.get("build_success", False),
                     "tests_found": res.get("tests_found", False),
                     "tests_success": res.get("tests_success"),
+                    "tests_preexisting_failures": res.get("tests_preexisting_failures", False),
                     "tests": res.get("tests", {}),
                     "resolved_version_matches": res.get("resolved_version_matches", False),
                     "resolved_checks": res.get("resolved_checks", []),

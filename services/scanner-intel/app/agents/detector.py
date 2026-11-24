@@ -208,7 +208,7 @@ class DetectorAgent:
         info = {"status": status, "class_graph": index.status,
                 "app_classes": index.app_classes, **counts, "findings": 0}
         if not index.available:
-            info["error"] = f"class graph {index.status}: tiers not determined (R = 12)"
+            info["error"] = f"class graph {index.status}: tiers not determined (M_reach = 0.75)"
         return out, info
 
     def _typosquats(self, components, sbom_sha256: str, registry: RegistryClient) -> CheckResult:

@@ -131,6 +131,11 @@ export default function HomePage() {
                         <div className="flex items-center gap-2">
                           <span className="truncate text-sm font-medium text-ink">{repoName(r.repo_url)}</span>
                           <StatusBadge status={r.status} />
+                          {r.kind === "confirmation" && (
+                            <Badge tone="info" title={`Confirmation run for an accepted fix of ${r.parent_run_id}`}>
+                              confirmation of {r.parent_run_id}
+                            </Badge>
+                          )}
                         </div>
                         <div className="mt-0.5 flex items-center gap-3 font-mono text-[11px] text-ink-muted">
                           <span>{r.run_id}</span>

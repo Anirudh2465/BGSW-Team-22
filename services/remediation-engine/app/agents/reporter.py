@@ -49,14 +49,10 @@ class ReporterAgent:
         vex_content = vex_tmpl.render(**context)
         vex_sha256 = hashlib.sha256(vex_content.encode("utf-8")).hexdigest()
 
-        # Check approval condition before opening PR
+        # PRs are opened by the writer App through POST /pull-request (the orchestrator calls it after a
+        # confirmed approval, with the repository and scanned commit the report request does not carry).
+        # The report never invents a PR URL.
         pr_url = None
-        for appr in approvals:
-            if appr.decision == "APPROVED":
-                # Verify exact patch hash matches
-                matching_rem = next((r for r in remediations if r.finding_id == appr.finding_id), None)
-                if matching_rem and matching_rem.patch_sha256 == appr.patch_sha256:
-                    pr_url = f"https://github.com/example/repo/pull/42"
 
         # Completeness Gate: all 3 report hashes exist
         completeness_passed = bool(md_sha256 and sarif_sha256 and vex_sha256)

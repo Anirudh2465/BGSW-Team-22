@@ -26,6 +26,8 @@ from guardian_contracts.state import Remediation
 
 MAX_RETRIES = 2
 NO_TESTS_WARNING = "no tests in the project: verified by build and rescan only"
+PREEXISTING_WARNING = ("the project's tests already fail without the patch (no new test failures): "
+                       "verified by build and rescan only")
 FINAL_STATES = ("verified", "no_safe_fix", "escalated")
 
 
@@ -62,12 +64,14 @@ def evaluate(rem: Remediation) -> Tuple[str, Dict[str, Any], Optional[str]]:
     finding_rows = [t for t in rescan.get("targets") or [] if t.get("finding_id") == rem.finding_id]
     rescan_ok = rescan.get("status") == "ok" and rescan.get("rescan_valid") is True
     tests_found = stage4.get("tests_found") is True
+    preexisting = tests_found and stage4.get("tests_success") is False and stage4.get("tests_preexisting_failures") is True
+    test_check = ("tests_passed" if not preexisting else "tests_no_new_failures") if tests_found else "tests_not_found"
     checks = [
         _check("patch_hash_matches", stage4.get("patch_sha256") == rem.patch_sha256, stage4.get("patch_sha256")),
         _check("patch_applied", stage4.get("patch_applied") is True),
         _check("build_success", stage4.get("build_success") is True, stage4.get("error")),
-        _check("tests_passed" if tests_found else "tests_not_found",
-               stage4.get("tests_success") is True if tests_found else True,
+        _check(test_check,
+               (stage4.get("tests_success") is True or preexisting) if tests_found else True,
                stage4.get("tests") or None),
         _check("resolved_version_matches", stage4.get("resolved_version_matches") is True,
                stage4.get("resolved_checks")),
@@ -80,9 +84,10 @@ def evaluate(rem: Remediation) -> Tuple[str, Dict[str, Any], Optional[str]]:
                 for a in rescan.get("new_advisories") or [] if a.get("risk_band") in ("Critical", "High")]),
     ]
     failed = [c["name"] for c in checks if not c["passed"]]
-    warning = NO_TESTS_WARNING if not tests_found else None
+    warning = NO_TESTS_WARNING if not tests_found else PREEXISTING_WARNING if preexisting else None
     record: Dict[str, Any] = {"possible": True, "checks": checks, "failed": failed, "evidence": evidence,
-                              "attempt": rem.retry_count, "tests_found": tests_found}
+                              "attempt": rem.retry_count, "tests_found": tests_found,
+                              "tests_preexisting_failures": preexisting}
     if rescan.get("status") == "error":
         # the build ran but the rescan could not: the fix cannot be proven, and another candidate would not help
         record.update({"outcome": "escalated", "possible": False,
