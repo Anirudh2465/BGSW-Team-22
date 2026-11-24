@@ -293,8 +293,10 @@ def test_verifier_keeps_records_and_skips_non_drafts(monkeypatch):
     none = Remediation(finding_id="b", state="no_safe_fix", validation={"remediation": {"reason": "x"}})
     res = VerifierAgent().verify_remediations("r1", [draft, none], "src")
     by = {r.finding_id: r for r in res.verified_remediations}
-    assert by["b"].state == "no_safe_fix" and "build_passed" not in by["b"].validation
-    assert by["a"].validation["selection"] == {"decided_by": "rule"} and "build_passed" in by["a"].validation
+    assert by["b"].state == "no_safe_fix" and "verification" not in by["b"].validation
+    # no stage-4 evidence attached: verification was not possible -> escalated, never verified
+    assert by["a"].state == "escalated" and by["a"].validation["verification"]["possible"] is False
+    assert by["a"].validation["selection"] == {"decided_by": "rule"}
 
 
 # ------------------------------------------------------------------ opt-in live check

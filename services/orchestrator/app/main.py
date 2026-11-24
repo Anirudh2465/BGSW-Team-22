@@ -19,6 +19,7 @@ from .config import config
 from .db.artifacts import artifact_store
 from .db.audit_chain import audit_chain
 from .db import neo4j_store
+from .db.run_store import run_store
 from .graph.builder import graph_runner
 from .graph.nodes import graph_artifacts
 
@@ -31,8 +32,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Run state (GuardianState) and run metadata (status, events). Postgres checkpointing
-# of graph state is wired with the approval interrupt in the next milestone.
+# Live view of run state (GuardianState) and run metadata (status, events, pending approvals). Graph state
+# is checkpointed by LangGraph (PostgresSaver in compose, thread_id = run_id) and run metadata by run_store,
+# so a run paused at the approval interrupt survives an orchestrator restart (restore_runs at startup).
 RUNS_DB: Dict[str, GuardianState] = {}
 RUN_META: Dict[str, Dict[str, Any]] = {}
 MAX_ARTIFACT_BYTES = 256 * 1024 * 1024
@@ -54,16 +56,22 @@ def require_internal_token(x_guardian_token: str = Header(default="")):
 
 
 # ----------------------------------------------------------------- execution
+RUN_LOCKS: Dict[str, threading.Lock] = {}
+
+
 def _emit(run_id: str, event_type: str, payload: Dict[str, Any]) -> None:
     meta = RUN_META[run_id]
     meta["events"].append({"event_type": event_type, "run_id": run_id, "timestamp": now_iso(),
                            "seq": len(meta["events"]) + 1, "payload": payload})
 
 
-def _run_worker(run_id: str, initial_state: GuardianState) -> None:
+def _persist(run_id: str) -> None:
+    run_store.save(run_id, {**RUN_META[run_id], "repo_url": RUNS_DB.get(run_id, {}).get("repo_url"),
+                            "commit_sha": RUNS_DB.get(run_id, {}).get("commit_sha")})
+
+
+def _callbacks(run_id: str):
     meta = RUN_META[run_id]
-    meta["status"] = "running"
-    _emit(run_id, "run_status", {"status": "running"})
 
     def on_update(node: str, delta: Dict[str, Any], _before: Dict[str, Any]):
         meta["current_node"] = node
@@ -78,17 +86,87 @@ def _run_worker(run_id: str, initial_state: GuardianState) -> None:
     def on_state(state: Dict[str, Any]):
         RUNS_DB[run_id] = state  # live snapshot for the dashboard
 
-    try:
-        final_state = graph_runner.run_pipeline(initial_state, on_update=on_update, on_state=on_state)
-        RUNS_DB[run_id] = final_state
-        stopped = any(g.get("gate") in STOPPING_GATES and not g.get("passed")
-                      for g in final_state.get("gate_results", []))
-        meta["status"] = "stopped" if stopped else "completed"
-    except Exception as exc:  # noqa: BLE001 - surfaced to the client
-        meta["status"] = "error"
-        meta["error"] = f"{type(exc).__name__}: {exc}"
+    return on_update, on_state
+
+
+def _settle(run_id: str, final_state: Dict[str, Any], interrupts: List[Any]) -> None:
+    meta = RUN_META[run_id]
+    RUNS_DB[run_id] = final_state
+    if interrupts:
+        # Paused at the approval interrupt: the checkpoint holds the state, no sandbox is held.
+        last = interrupts[-1] if isinstance(interrupts[-1], dict) else {}
+        meta["status"] = "awaiting_approval"
+        meta["pending_approvals"] = last.get("pending", [])
+        meta["decisions"] = {}
+        _emit(run_id, "run_status", {"status": "awaiting_approval", "pending": len(meta["pending_approvals"])})
+        return
+    stopped = any(g.get("gate") in STOPPING_GATES and not g.get("passed")
+                  for g in final_state.get("gate_results", []))
+    meta["status"] = "stopped" if stopped else "completed"
+    meta["pending_approvals"] = []
     meta["finished_at"] = now_iso()
     _emit(run_id, "run_status", {"status": meta["status"], "error": meta.get("error")})
+
+
+def _drive(run_id: str, step) -> None:
+    """Run (or resume) the graph for one run under its lock; any failure becomes status "error"."""
+    meta = RUN_META[run_id]
+    lock = RUN_LOCKS.setdefault(run_id, threading.Lock())
+    with lock:
+        meta["status"] = "running"
+        _emit(run_id, "run_status", {"status": "running"})
+        on_update, on_state = _callbacks(run_id)
+        try:
+            final_state, interrupts = step(on_update, on_state)
+            _settle(run_id, final_state, interrupts)
+        except Exception as exc:  # noqa: BLE001 - surfaced to the client
+            meta["status"] = "error"
+            meta["error"] = f"{type(exc).__name__}: {exc}"
+            meta["finished_at"] = now_iso()
+            _emit(run_id, "run_status", {"status": "error", "error": meta["error"]})
+        finally:
+            _persist(run_id)
+
+
+def _run_worker(run_id: str, initial_state: GuardianState) -> None:
+    _drive(run_id, lambda u, s: graph_runner.run_pipeline(initial_state, on_update=u, on_state=s))
+
+
+def _resume_worker(run_id: str, decisions: Dict[str, Any]) -> None:
+    _drive(run_id, lambda u, s: graph_runner.resume(run_id, decisions, on_update=u, on_state=s))
+
+
+def _start(target, *args) -> None:
+    if RUN_SYNC:
+        target(*args)
+    else:
+        threading.Thread(target=target, args=args, name=f"run-{args[0]}", daemon=True).start()
+
+
+def restore_runs() -> int:
+    """After a restart: reload run metadata and the latest checkpointed state of every known run."""
+    restored = 0
+    for run_id, meta in run_store.load_all().items():
+        if run_id in RUN_META:
+            continue
+        try:
+            state = graph_runner.snapshot(run_id)
+        except Exception:  # noqa: BLE001 - an unreadable checkpoint must not stop the service
+            state = None
+        if not state:
+            continue
+        meta = dict(meta)
+        meta.setdefault("events", [])
+        if meta.get("status") in ("running", "queued", "resuming"):
+            # the worker died with the process; the checkpoint shows how far it got
+            paused = bool(graph_runner.interrupts(run_id))
+            meta["status"] = "awaiting_approval" if paused else "error"
+            if not paused:
+                meta["error"] = "orchestrator restarted while the run was in progress"
+        RUN_META[run_id] = meta
+        RUNS_DB[run_id] = state
+        restored += 1
+    return restored
 
 
 def _initial_state(run_id: str, req: RunCreateRequest) -> GuardianState:
@@ -126,12 +204,20 @@ def _run_response(run_id: str) -> RunResponse:
 
 
 # --------------------------------------------------------------------- routes
+@app.on_event("startup")
+def _restore_on_startup():
+    if not RUN_SYNC:
+        restore_runs()
+
+
 @app.get("/health")
 def health():
     return {
         "status": "healthy",
         "service": "orchestrator",
         "artifact_backend": artifact_store.backend,
+        "checkpoint_backend": graph_runner.checkpoint_backend,
+        "run_store_backend": run_store.backend,
         "neo4j_enabled": neo4j_store.neo4j_exporter.enabled,
         "audit_chain_head": audit_chain.get_chain_head(),
     }
@@ -142,12 +228,10 @@ def create_run(req: RunCreateRequest):
     run_id = f"run-{uuid.uuid4().hex[:8]}"
     initial_state = _initial_state(run_id, req)
     RUNS_DB[run_id] = initial_state
-    RUN_META[run_id] = {"status": "queued", "created_at": now_iso(), "events": [], "environment": req.environment}
-
-    if RUN_SYNC:
-        _run_worker(run_id, initial_state)
-    else:
-        threading.Thread(target=_run_worker, args=(run_id, initial_state), name=f"run-{run_id}", daemon=True).start()
+    RUN_META[run_id] = {"status": "queued", "created_at": now_iso(), "events": [], "environment": req.environment,
+                        "pending_approvals": [], "decisions": {}}
+    _persist(run_id)
+    _start(_run_worker, run_id, initial_state)
     return _run_response(run_id)
 
 
@@ -175,6 +259,8 @@ def get_run(run_id: str):
         "policy_verdicts": state["policy_verdicts"],
         "remediations": state["remediations"],
         "approvals": state["approvals"],
+        "pending_approvals": meta.get("pending_approvals", []),
+        "decisions": meta.get("decisions", {}),
         "gate_results": state["gate_results"],
         "final_report": state["final_report"],
         "audit_chain_head": audit_chain.get_chain_head(),
@@ -306,9 +392,12 @@ def list_runs():
 
 @app.post("/runs/{run_id}/approve", response_model=ApprovalResponse)
 def approve_patch(run_id: str, req: ApprovalRequest):
+    """Record a human decision for one verified remediation. The graph waits at the approval interrupt and is
+    resumed once every pending remediation has a decision (Invariant 2: only ``verified`` patches, matched by
+    their exact patch_sha256)."""
     if run_id not in RUNS_DB:
         raise HTTPException(status_code=404, detail="Run not found")
-
+    meta = RUN_META[run_id]
     state = RUNS_DB[run_id]
     rem = state.get("remediations", {}).get(req.finding_id)
     if not rem:
@@ -321,21 +410,68 @@ def approve_patch(run_id: str, req: ApprovalRequest):
     if rem.patch_sha256 != req.patch_sha256:
         raise HTTPException(status_code=400, detail="Patch SHA-256 mismatch")
 
-    approval = Approval(
-        finding_id=req.finding_id,
-        decision=req.decision,
-        user_id=req.user_id,
-        patch_sha256=req.patch_sha256
-    )
-    state["approvals"][req.finding_id] = approval
-    audit_chain.record_transition(run_id, "human_approval", approval.model_dump())
+    lock = RUN_LOCKS.setdefault(run_id, threading.Lock())
+    if not lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="Run is busy; try again")
+    try:
+        if meta.get("status") != "awaiting_approval":
+            raise HTTPException(status_code=409,
+                                detail=f"Run is not waiting for approval (status: {meta.get('status')})")
+        pending = {p["finding_id"]: p for p in meta.get("pending_approvals", [])}
+        if req.finding_id not in pending:
+            raise HTTPException(status_code=409, detail="This remediation is not pending a decision")
 
-    return ApprovalResponse(
-        run_id=run_id,
-        finding_id=req.finding_id,
-        decision=req.decision,
-        status="recorded"
-    )
+        decisions = meta.setdefault("decisions", {})
+        decisions[req.finding_id] = {"decision": req.decision, "user_id": req.user_id,
+                                     "patch_sha256": req.patch_sha256, "at": now_iso()}
+        audit_chain.record_transition(run_id, "human_approval", {"finding_id": req.finding_id,
+                                                                 **decisions[req.finding_id]})
+        _emit(run_id, "audit", {"kind": "approval", "finding_id": req.finding_id, "decision": req.decision})
+        remaining = [fid for fid in pending if fid not in decisions]
+        if not remaining:
+            meta["status"] = "resuming"
+        _persist(run_id)
+    finally:
+        lock.release()
+
+    if remaining:
+        return ApprovalResponse(run_id=run_id, finding_id=req.finding_id, decision=req.decision, status="recorded")
+    _start(_resume_worker, run_id, {fid: dict(d) for fid, d in decisions.items()})
+    return ApprovalResponse(run_id=run_id, finding_id=req.finding_id, decision=req.decision, status="resumed")
+
+
+@app.get("/runs/{run_id}/approvals")
+def get_approvals(run_id: str):
+    if run_id not in RUN_META:
+        raise HTTPException(status_code=404, detail="Run not found")
+    meta = RUN_META[run_id]
+    return {"run_id": run_id, "status": meta.get("status"), "pending": meta.get("pending_approvals", []),
+            "decisions": meta.get("decisions", {}), "approvals": RUNS_DB.get(run_id, {}).get("approvals", {})}
+
+
+def _run_patches(state: GuardianState) -> set:
+    shas = set()
+    for rem in (state.get("remediations") or {}).values():
+        if rem.patch_sha256:
+            shas.add(rem.patch_sha256)
+        for attempt in (rem.validation or {}).get("attempts") or []:
+            if isinstance(attempt, dict) and attempt.get("patch_sha256"):
+                shas.add(attempt["patch_sha256"])
+    return shas
+
+
+@app.get("/runs/{run_id}/patches/{patch_sha256}")
+def get_patch(run_id: str, patch_sha256: str):
+    """The exact patch bytes a remediation refers to (only patches of this run's remediations)."""
+    if run_id not in RUNS_DB:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if patch_sha256 not in _run_patches(RUNS_DB[run_id]):
+        raise HTTPException(status_code=404, detail="not a patch of this run")
+    data = artifact_store.get(patch_sha256)
+    if data is None:
+        raise HTTPException(status_code=404, detail="patch content missing from the store")
+    return Response(content=data, media_type="text/x-diff; charset=utf-8",
+                    headers={"X-Artifact-SHA256": patch_sha256})
 
 
 # ------------------------------------------------- internal artifact broker API

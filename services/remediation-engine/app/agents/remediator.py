@@ -23,7 +23,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from guardian_contracts.api_schemas import RemediateResponse
 from guardian_contracts.state import Finding, Remediation
 
-from ..remediation.candidates import ENRICHMENT_TOOL, ComponentPlan, group_findings, plan_candidates
+from ..remediation.candidates import ENRICHMENT_TOOL, ComponentPlan, group_findings, parse_purl, plan_candidates
 from ..remediation.patchers import Unpatchable, is_manifest, make_patch, read_manifests
 from ..remediation.registry import VersionRegistry
 
@@ -202,6 +202,84 @@ class RemediatorAgent:
                                    "reason_evidence_ids": cites,
                                    "transcript_sha256": transcript_sha, "rule": RULE}
         return choices
+
+    # ------------------------------------------------------------------ retry (next candidate)
+    def next_candidates(self, run_id: str, remediations: List[Remediation],
+                        source_sha256: Optional[str]) -> Tuple[List[Remediation], bool]:
+        """After a failed verification: a new draft for ``candidates[chosen + 1]`` (code-built list, same rules),
+        ``retry_count + 1``. No further candidate, or a patch that cannot be written -> ``escalated``.
+        Returns (remediations, fix-safety gate)."""
+        from .verifier import MAX_RETRIES
+        files: Optional[Dict[str, str]] = None
+        source_error: Optional[str] = None
+        try:
+            files = read_manifests(self.artifacts.get(source_sha256)) if source_sha256 else None
+            source_error = None if files is not None else "no source artifact"
+        except Exception as exc:
+            source_error = f"source artifact not readable: {type(exc).__name__}"
+
+        stored: Dict[str, str] = {}
+        out: List[Remediation] = []
+        for rem in remediations:
+            v = dict(rem.validation or {})
+            verification = v.get("verification") or {}
+            if rem.state != "draft" or verification.get("outcome") != "retry":
+                out.append(rem)  # only remediations the Verification gate sent back are moved on
+                continue
+            attempts = list(v.get("attempts") or [])
+            attempts.append({"chosen": rem.chosen, "candidate": rem.candidates[rem.chosen] if rem.chosen is not None
+                             and 0 <= rem.chosen < len(rem.candidates) else None, "patch_sha256": rem.patch_sha256,
+                             "retry_count": rem.retry_count, "verification": verification,
+                             "stage4": v.get("stage4"), "rescan": v.get("rescan")})
+            base = {k: val for k, val in v.items() if k not in ("verification", "stage4", "rescan", "warning")}
+            base["attempts"] = attempts
+
+            def escalate(reason: str) -> Remediation:
+                return rem.model_copy(update={"state": "escalated", "validation": {
+                    **base, "verification": {**verification, "outcome": "escalated", "reason": reason}}})
+
+            nxt = (rem.chosen if rem.chosen is not None else -1) + 1
+            if rem.retry_count >= MAX_RETRIES:
+                out.append(escalate(f"verification failed and the {MAX_RETRIES} retries are used up"))
+                continue
+            if nxt >= len(rem.candidates):
+                out.append(escalate(f"verification failed and no further code-built candidate exists "
+                                    f"({len(rem.candidates)} tried)"))
+                continue
+            if files is None:
+                out.append(escalate(source_error or "source not available"))
+                continue
+            parsed = parse_purl(rem.candidates[nxt])
+            if not parsed or not parsed[3]:
+                out.append(escalate(f"candidate {rem.candidates[nxt]!r} is not a versioned purl"))
+                continue
+            eco, ns, name, version = parsed
+            try:
+                patch = make_patch(files, eco, ns, name, version)
+            except Unpatchable as exc:
+                out.append(escalate(f"cannot write the fix for the next candidate automatically: {exc}"))
+                continue
+            diff = patch.diff()
+            if not diff.strip():
+                out.append(escalate("the manifest already declares the next candidate's version (empty patch)"))
+                continue
+            try:
+                sha = self.artifacts.put(run_id, "remediate", PATCH_MEDIA_TYPE, diff.encode("utf-8"))
+            except Exception as exc:
+                out.append(escalate(f"patch could not be stored: {type(exc).__name__}"))
+                continue
+            stored[sha] = diff
+            remediation_info = {**(base.get("remediation") or {}), "target_version": version, "method": patch.method,
+                                "files": diff_paths(diff)}
+            selection = {"chosen": nxt, "chosen_version": version, "decided_by": "retry",
+                         "rule": "next code-built candidate after a failed verification",
+                         "previous": (base.get("selection") or {}).get("chosen", rem.chosen),
+                         "reason_evidence_ids": []}
+            out.append(rem.model_copy(update={
+                "chosen": nxt, "patch_sha256": sha, "retry_count": rem.retry_count + 1, "state": "draft",
+                "validation": {**base, "remediation": remediation_info, "selection": selection}}))
+        # Fix-safety gate over the drafts written here: in-list index, stored manifest-only patch
+        return out, self._fix_safety_gate([r for r in out if r.patch_sha256 in stored], stored)
 
     # ------------------------------------------------------------------ gate + inputs
     @staticmethod

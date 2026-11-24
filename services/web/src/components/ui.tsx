@@ -57,14 +57,22 @@ export function Badge({ tone = "neutral", className, children, title }: { tone?:
   );
 }
 
-const STATUS_TONE: Record<string, Tone> = { queued: "neutral", running: "accent", completed: "success", stopped: "warning", error: "danger" };
+const STATUS_TONE: Record<string, Tone> = {
+  queued: "neutral",
+  running: "accent",
+  resuming: "accent",
+  awaiting_approval: "warning",
+  completed: "success",
+  stopped: "warning",
+  error: "danger",
+};
 
 export function StatusBadge({ status, detail }: { status?: string | null; detail?: string | null }) {
   const s = status || "unknown";
   return (
     <Badge tone={STATUS_TONE[s] ?? "neutral"}>
-      <span className={cn("h-1.5 w-1.5 rounded-full bg-current", s === "running" && "animate-pulse")} />
-      {s}
+      <span className={cn("h-1.5 w-1.5 rounded-full bg-current", (s === "running" || s === "resuming") && "animate-pulse")} />
+      {s.replace(/_/g, " ")}
       {detail ? <span className="opacity-70">· {detail}</span> : null}
     </Badge>
   );

@@ -280,19 +280,4 @@ def test_redact_trufflehog_drops_raw_values():
     out = redact_trufflehog(b'{"Raw":"x","RawV2":"y","Redacted":"z"}\nnot-json\n')
     assert json.loads(out) == {"Redacted": "z"}
 
-
-# ------------------------------------------------------------------ stage 4
-def test_stage_api_verify():
-    client = TestClient(launcher_main.app)
-    req = {
-        "run_id": "test-run-1",
-        "stage": "verify",
-        "source_artifact_sha256": "abcdef123456",
-        "parameters": {"patch_content": "--- a/pom.xml\n+++ b/pom.xml\n-2.14.1\n+2.17.1"},
-    }
-    res = client.post("/stages/run", json=req)
-    assert res.status_code == 200
-    data = res.json()
-    assert data["status"] == "success"
-    assert data["details"]["build_success"] is True
-    assert data["details"]["test_success"] is True
+# Stage 4 (verify) has its own suite: tests/test_stage4_verify.py

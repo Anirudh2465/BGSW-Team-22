@@ -10,6 +10,11 @@ class OrchestratorConfig:
     REMEDIATION_ENGINE_URL: str = os.getenv("REMEDIATION_ENGINE_URL", "http://remediation-engine:8003")
     # Shared secret for service-to-service calls (launcher stages, internal artifact API)
     INTERNAL_API_TOKEN: str = os.getenv("INTERNAL_API_TOKEN", "")
+    # LangGraph checkpointer: "postgres" (PostgresSaver, thread_id = run_id) or "memory"; follows the artifact
+    # backend unless set explicitly.
+    CHECKPOINT_BACKEND: str = os.getenv("CHECKPOINT_BACKEND", os.getenv("ARTIFACT_BACKEND", "memory"))
+    VERIFY_TIMEOUT_S: float = float(os.getenv("VERIFY_HTTP_TIMEOUT_S", "120"))
+    RESCAN_TIMEOUT_S: float = float(os.getenv("RESCAN_HTTP_TIMEOUT_S", "1500"))
     RECURSION_LIMIT: int = int(os.getenv("RECURSION_LIMIT", "60"))
     # Per-stage HTTP timeouts (seconds); sandboxes enforce their own limits underneath
     STAGE_TIMEOUTS = {

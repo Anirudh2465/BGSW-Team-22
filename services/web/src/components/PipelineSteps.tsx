@@ -5,7 +5,7 @@ import { Check, Circle, Loader2, X } from "lucide-react";
 import type { GateResult, RunData } from "../lib/api";
 import { cn, humanize } from "../lib/utils";
 
-/** The nine deterministic gates, in pipeline order. */
+/** The deterministic gates, in pipeline order. */
 export const GATE_ORDER = [
   "clone_integrity_gate",
   "manifest_profile_gate",
@@ -14,7 +14,9 @@ export const GATE_ORDER = [
   "cross_check_gate",
   "grounding_gate",
   "policy_consistency_gate",
+  "fix_safety_gate",
   "verification_gate",
+  "human_decision_gate",
   "completeness_gate",
 ];
 
@@ -29,7 +31,7 @@ export function latestGates(gates: GateResult[] = []) {
 export function PipelineSteps({ run, compact }: { run: RunData; compact?: boolean }) {
   const steps = latestGates(run.gate_results);
   const firstPending = steps.findIndex((s) => !s.result);
-  const running = run.status === "running" || run.status === "queued";
+  const running = run.status === "running" || run.status === "queued" || run.status === "resuming";
   return (
     <ol className={cn("flex", compact ? "items-center gap-1" : "flex-col gap-0")}>
       {steps.map((s, i) => {

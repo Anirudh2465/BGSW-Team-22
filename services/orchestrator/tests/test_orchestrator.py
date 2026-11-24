@@ -85,9 +85,9 @@ def test_pipeline_execution_and_approval():
     assert run_res.status_code == 200
     run_data = run_res.json()
     assert run_data["status"] == "completed"
-    assert len(run_data["gate_results"]) == 9
-    assert gates(run_data)[:4] == ["clone_integrity_gate", "manifest_profile_gate", "hook_observation_gate",
-                                   "coverage_gate"]
+    assert gates(run_data) == ["clone_integrity_gate", "manifest_profile_gate", "hook_observation_gate",
+                               "coverage_gate", "cross_check_gate", "grounding_gate", "policy_consistency_gate",
+                               "fix_safety_gate", "verification_gate", "human_decision_gate", "completeness_gate"]
     assert run_data["commit_sha"] == COMMIT  # HEAD pinned to the scanned commit
 
     graph = client.get(f"/runs/{run_id}/graph").json()
@@ -98,36 +98,22 @@ def test_pipeline_execution_and_approval():
     assert events[-1]["payload"]["status"] == "completed"
     assert any(e["event_type"] == "gate_result" and e["payload"]["gate_name"] == "coverage_gate" for e in events)
 
-    RUNS_DB[run_id]["remediations"]["f-1"] = Remediation(
-        finding_id="f-1",
-        candidates=["pkg:maven/org.apache.logging.log4j/log4j-core@2.17.1"],
-        chosen=0,
-        patch_sha256="abc123456789",
-        state="verified"
-    )
+    # Mock services never produce a real stage-4 result, so nothing is verified and nothing waits for approval.
+    rem = next(iter(run_data["remediations"].values()))
+    assert rem["state"] == "escalated" and "verification not possible" in rem["validation"]["verification"]["reason"]
 
-    appr_res = client.post(f"/runs/{run_id}/approve", json={
-        "finding_id": "f-1",
-        "decision": "APPROVED",
-        "user_id": "secops-analyst-1",
-        "patch_sha256": "abc123456789"
-    })
-    assert appr_res.status_code == 200
-    assert appr_res.json()["status"] == "recorded"
+    # A completed run accepts no approvals, and an unverified remediation can never be approved.
+    RUNS_DB[run_id]["remediations"]["f-1"] = Remediation(
+        finding_id="f-1", candidates=["pkg:maven/org.apache.logging.log4j/log4j-core@2.17.1"], chosen=0,
+        patch_sha256="abc123456789", state="verified")
+    late = client.post(f"/runs/{run_id}/approve", json={
+        "finding_id": "f-1", "decision": "APPROVED", "user_id": "secops-analyst-1", "patch_sha256": "abc123456789"})
+    assert late.status_code == 409
 
     RUNS_DB[run_id]["remediations"]["f-unverified"] = Remediation(
-        finding_id="f-unverified",
-        candidates=["pkg:maven/test@1.1.0"],
-        chosen=0,
-        patch_sha256="999888",
-        state="draft"
-    )
+        finding_id="f-unverified", candidates=["pkg:maven/test@1.1.0"], chosen=0, patch_sha256="999888", state="draft")
     bad_res = client.post(f"/runs/{run_id}/approve", json={
-        "finding_id": "f-unverified",
-        "decision": "APPROVED",
-        "user_id": "secops-analyst-1",
-        "patch_sha256": "999888"
-    })
+        "finding_id": "f-unverified", "decision": "APPROVED", "user_id": "secops-analyst-1", "patch_sha256": "999888"})
     assert bad_res.status_code == 400
     assert "not been verified" in bad_res.json()["detail"]
 
@@ -198,17 +184,18 @@ def fake(monkeypatch):
                      "call_cartographer", "call_discover"):
             monkeypatch.setattr(service_clients, name, getattr(services, name))
         # Back half (detect onwards) is out of scope here: use its built-in mock responses.
-        for name in ("call_detect", "call_prioritize", "call_policy", "call_remediate", "call_verify", "call_report"):
+        for name in ("call_detect", "call_prioritize", "call_policy", "call_remediate", "call_remediate_next",
+                     "call_verify", "call_report"):
             monkeypatch.setattr(service_clients, name, _mocked(getattr(service_clients, name)))
         return services
     return install
 
 
 def _mocked(fn):
-    def inner(req):
+    def inner(*args):
         service_clients.mock_mode = True
         try:
-            return fn(req)
+            return fn(*args)
         finally:
             service_clients.mock_mode = False
     return inner

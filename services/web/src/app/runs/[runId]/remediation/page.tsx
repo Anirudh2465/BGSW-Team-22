@@ -14,11 +14,12 @@ export default function RemediationPage() {
         <div className="mb-5 flex items-start gap-3 rounded-xl bg-accent/[0.06] p-4 ring-1 ring-inset ring-accent/20">
           <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-accent-soft" />
           <p className="text-xs leading-relaxed text-ink-soft">
-            Order is fixed: <b className="text-ink">remediate → verify → approve → open PR</b>. You only sign off on patches that already built and passed
-            tests in the sandbox. Unverified patches stay locked.
+            Order is fixed: <b className="text-ink">remediate → verify → approve → open PR</b>. You only sign off on the exact patch that the sandbox
+            applied to a clean checkout, built, tested, re-resolved and rescanned clean. Unverified patches stay locked; a failed patch is retried with the
+            next code-built candidate (at most twice) and then escalated.
           </p>
         </div>
-        <ApprovalQueue runId={run.run_id} remediations={run.remediations ?? {}} findings={run.findings ?? {}} verdicts={run.policy_verdicts ?? {}} onApproved={reload} />
+        <ApprovalQueue run={run} findings={run.findings ?? {}} verdicts={run.policy_verdicts ?? {}} onDecided={reload} />
       </div>
     </div>
   );

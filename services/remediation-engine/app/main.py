@@ -1,4 +1,7 @@
+from typing import List
+
 from fastapi import FastAPI
+from pydantic import BaseModel
 from guardian_contracts.api_schemas import (
     PrioritizeRequest,
     PrioritizeResponse,
@@ -11,6 +14,7 @@ from guardian_contracts.api_schemas import (
     ReportRequest,
     ReportResponse,
 )
+from guardian_contracts.state import Finding, Remediation
 from .agents.prioritizer import PrioritizerAgent
 from .agents.policy import PolicyAgent
 from .agents.remediator import RemediatorAgent
@@ -54,6 +58,27 @@ def remediate(req: RemediateRequest):
         findings=req.findings_to_fix,
         source_sha256=req.source_artifact_sha256,
     )
+
+# Service-local models (not shared contracts): RemediateRequest cannot carry previous attempts.
+class NextCandidateRequest(BaseModel):
+    run_id: str
+    source_artifact_sha256: str
+    remediations: List[Remediation]
+    findings: List[Finding] = []
+
+
+class NextCandidateResponse(BaseModel):
+    run_id: str
+    remediations: List[Remediation]
+    gate_passed: bool
+
+
+@app.post("/remediate/next", response_model=NextCandidateResponse)
+def remediate_next(req: NextCandidateRequest):
+    """New draft for the next code-built candidate of each remediation the Verification gate sent back."""
+    rems, gate = remediator_agent.next_candidates(req.run_id, req.remediations, req.source_artifact_sha256)
+    return NextCandidateResponse(run_id=req.run_id, remediations=rems, gate_passed=gate)
+
 
 @app.post("/verify", response_model=VerifyResponse)
 def verify(req: VerifyRequest):

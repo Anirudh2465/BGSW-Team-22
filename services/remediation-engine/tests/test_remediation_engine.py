@@ -115,9 +115,21 @@ def test_remediation_engine_pipeline_api(monkeypatch):
     assert rems[0]["patch_sha256"] is not None
     assert "+            <version>2.25.4</version>" in store.get(rems[0]["patch_sha256"]).decode()
 
+    # evidence as the orchestrator attaches it after stage 4 and the scanner-intel rescan
+    rems[0]["validation"]["stage4"] = {
+        "status": "success", "patch_sha256": rems[0]["patch_sha256"], "bundle_sha256": "b" * 64,
+        "patch_applied": True, "build_success": True, "tests_found": False, "tests_success": None,
+        "resolved_version_matches": True}
+    rems[0]["validation"]["rescan"] = {
+        "status": "ok", "rescan_valid": True, "result_sha256": "r" * 64, "new_high_or_critical": 0,
+        "new_advisories": [], "targets": [{"finding_id": "f1", "still_present": False}]}
     v_res = client.post("/verify", json={"run_id": "r1", "remediations": rems, "source_artifact_sha256": source})
     assert v_res.status_code == 200
     assert v_res.json()["gate_passed"] is True
+    verified = v_res.json()["verified_remediations"][0]
+    assert verified["state"] == "verified"
+    assert verified["validation"]["warning"].startswith("no tests in the project")
+    rems = v_res.json()["verified_remediations"]
 
     appr = Approval(finding_id="f1", decision="APPROVED", patch_sha256=rems[0]["patch_sha256"])
     rep_res = client.post("/report", json={

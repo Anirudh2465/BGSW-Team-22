@@ -67,7 +67,8 @@ export function RunProvider({ runId, children }: { runId: string; children: Reac
   // Polling fallback while the run is in progress (WebSockets can be blocked by proxies).
   useEffect(() => {
     if (run && isTerminal(run.status)) return;
-    const t = setInterval(reload, 3000);
+    // A run paused at the approval interrupt changes only when someone decides: poll slowly.
+    const t = setInterval(reload, run?.status === "awaiting_approval" ? 15000 : 3000);
     return () => clearInterval(t);
   }, [run, reload]);
 

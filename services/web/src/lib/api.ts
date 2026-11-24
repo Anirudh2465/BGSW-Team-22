@@ -35,6 +35,15 @@ export interface Remediation {
   state: "draft" | "verified" | "no_safe_fix" | "escalated";
 }
 
+/** A verified remediation waiting at the approval interrupt. */
+export interface PendingApproval {
+  finding_id: string;
+  patch_sha256: string;
+  target?: string | null;
+  retry_count: number;
+  warning?: string | null;
+}
+
 export interface GateResult {
   gate: string;
   passed: boolean;
@@ -46,7 +55,7 @@ export interface GateResult {
 }
 
 export type CoverageStatus = "scanned" | "single_source" | "skipped";
-export type RunStatus = "queued" | "running" | "completed" | "stopped" | "error";
+export type RunStatus = "queued" | "running" | "awaiting_approval" | "resuming" | "completed" | "stopped" | "error";
 
 export interface RunData {
   run_id: string;
@@ -64,7 +73,9 @@ export interface RunData {
   findings: Record<string, Finding>;
   policy_verdicts: Record<string, "PASS" | "BLOCK">;
   remediations: Record<string, Remediation>;
-  approvals: Record<string, unknown>;
+  approvals: Record<string, { decision: "APPROVED" | "REJECTED" | "PENDING"; user_id?: string | null; patch_sha256?: string | null }>;
+  pending_approvals?: PendingApproval[];
+  decisions?: Record<string, { decision: "APPROVED" | "REJECTED"; user_id: string; patch_sha256: string; at?: string }>;
   gate_results: GateResult[];
   final_report?: {
     markdown_sha256?: string;
@@ -276,10 +287,25 @@ export const createRun = (repoUrl: string, commitSha: string = "HEAD") =>
     body: JSON.stringify({ repo_url: repoUrl, commit_sha: commitSha || "HEAD" }),
   });
 
-export const approvePatch = (runId: string, findingId: string, patchSha256: string, userId = "dashboard-user") =>
-  request(`/runs/${encodeURIComponent(runId)}/approve`, {
+export const approvePatch = (
+  runId: string,
+  findingId: string,
+  patchSha256: string,
+  decision: "APPROVED" | "REJECTED" = "APPROVED",
+  userId = "dashboard-user",
+) =>
+  request<{ status: "recorded" | "resumed" }>(`/runs/${encodeURIComponent(runId)}/approve`, {
     method: "POST",
-    body: JSON.stringify({ finding_id: findingId, decision: "APPROVED", user_id: userId, patch_sha256: patchSha256 }),
+    body: JSON.stringify({ finding_id: findingId, decision, user_id: userId, patch_sha256: patchSha256 }),
   });
+
+/** The exact patch (unified diff) a remediation refers to, by its SHA-256. */
+export async function fetchPatch(runId: string, patchSha256: string): Promise<string> {
+  const res = await fetch(`${ORCHESTRATOR_URL}/runs/${encodeURIComponent(runId)}/patches/${encodeURIComponent(patchSha256)}`, {
+    cache: "no-store",
+  });
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return res.text();
+}
 
 export const isTerminal = (status?: RunStatus) => status === "completed" || status === "stopped" || status === "error";

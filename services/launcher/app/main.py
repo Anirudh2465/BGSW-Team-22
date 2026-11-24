@@ -116,19 +116,29 @@ def run_stage(req: StageRunRequest):
             )
 
         if stage == "verify":
-            patch = req.parameters.get("patch_content", "")
+            # Inputs by hash only: the source tarball and the patch artifact (never patch text in parameters).
             res = run_stage4_verify(run_id=req.run_id, source_sha256=req.source_artifact_sha256 or "",
-                                    patch_content=patch, parameters=req.parameters)
+                                    patch_sha256=req.patch_artifact_sha256 or "", parameters=req.parameters,
+                                    runner=runner, store=store)
             return StageRunResponse(
                 run_id=req.run_id,
                 stage="verify",
-                status="success" if res.get("status") == "success" else "failure",
-                artifact_sha256=res.get("verified_patch_sha256"),
+                status=res.get("status", "error"),
+                artifact_sha256=res.get("bundle_sha256"),
                 metrics=res.get("metrics", {}),
                 details={
+                    "patch_sha256": res.get("patch_sha256"),
+                    "patch_applied": res.get("patch_applied", False),
                     "build_success": res.get("build_success", False),
-                    "test_success": res.get("test_success", False),
-                    "rescan_clean": res.get("rescan_clean", False),
+                    "tests_found": res.get("tests_found", False),
+                    "tests_success": res.get("tests_success"),
+                    "tests": res.get("tests", {}),
+                    "resolved_version_matches": res.get("resolved_version_matches", False),
+                    "resolved_checks": res.get("resolved_checks", []),
+                    "sbom_generated": res.get("sbom_generated", False),
+                    "steps": res.get("steps", {}),
+                    "error": res.get("error"),
+                    "stderr_tail": res.get("stderr_tail", ""),
                 },
             )
         raise HTTPException(status_code=400, detail=f"Unknown stage: {stage}")
