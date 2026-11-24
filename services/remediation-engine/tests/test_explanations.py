@@ -163,6 +163,23 @@ def test_hallucinated_number_twice_falls_back_to_the_template():
     assert len(rec.requests) == 2
 
 
+def test_overloaded_primary_model_falls_back_to_the_pinned_second_model():
+    seen = []
+
+    def handler(request):
+        seen.append(request.url.path)
+        return httpx.Response(503) if "gemini-3.8-flash" in request.url.path else gemini_reply(GOOD)
+    store = InMemoryArtifactClient()
+    agent = PrioritizerAgent(artifacts=store, gemini_factory=lambda: GeminiAdapter(
+        api_key=KEY, model="gemini-3.8-flash", fallback_model="gemini-3.5-flash", transport=httpx.MockTransport(handler)))
+    res = agent.prioritize_findings("r1", findings(enrichment(store)))
+    gem = [e for e in by_id(res)["log4j"].evidence if e.tool == "gemini"][0]
+    assert gem.id == "gemini:gemini-3.5-flash:explanation"
+    call = json.loads(store.get(gem.artifact_sha256))["calls"][0]
+    assert call["model"] == "gemini-3.5-flash" and call["fallback_from"] == ["gemini-3.8-flash: HTTP 503"]
+    assert sum("3.8" in p for p in seen) == 2  # primary tried twice (one retry) before the fallback
+
+
 @pytest.mark.parametrize("status", [429, 500])
 def test_gemini_errors_fall_back_and_never_block(status):
     store = InMemoryArtifactClient()

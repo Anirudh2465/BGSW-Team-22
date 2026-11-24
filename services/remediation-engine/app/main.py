@@ -51,7 +51,8 @@ def policy(req: PolicyRequest):
 def remediate(req: RemediateRequest):
     return remediator_agent.generate_remediations(
         run_id=req.run_id,
-        findings=req.findings_to_fix
+        findings=req.findings_to_fix,
+        source_sha256=req.source_artifact_sha256,
     )
 
 @app.post("/verify", response_model=VerifyResponse)
