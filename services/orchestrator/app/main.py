@@ -13,6 +13,7 @@ from guardian_contracts.api_schemas import (
     RunCreateRequest,
     RunResponse,
     ApprovalRequest,
+    StageRunRequest,
     ApprovalResponse,
     GenerateReportRequest,
     GenerateReportResponse,
@@ -20,7 +21,7 @@ from guardian_contracts.api_schemas import (
 )
 from guardian_contracts.state import GuardianState, Approval, Remediation
 from pydantic import BaseModel
-from .clients import service_clients
+from .clients import ServiceError, service_clients
 from .config import config
 from .db.artifacts import artifact_store
 from .db.audit_chain import audit_chain
@@ -750,7 +751,98 @@ def _confirm_worker(child_id: str, parent_id: str, patch: str) -> None:
         _persist(parent_id)
     if resume_with is not None:
         _start(_resume_worker, parent_id, resume_with)
+    pushed = (conf.get("pull_request") or {})
+    if passed and pushed.get("status") in ("pushed", "already_pushed") and pushed.get("commit_sha"):
+        # the fix is on the fork now: clone that exact commit and run it, to show the app still works
+        try:
+            _start_fixed_preview(parent_id, pushed["commit_sha"])
+        except Exception as exc:  # noqa: BLE001 - shown on the dashboard
+            RUN_META[parent_id].setdefault("previews", {})["fixed"] = {"status": "error", "error": str(exc)[:300],
+                                                                     "commit_sha": pushed["commit_sha"]}
+            _persist(parent_id)
 
+
+
+# ------------------------------------------------------------------ live app previews
+class PreviewStartRequest(BaseModel):
+    target: str = "original"   # "original" = the scanned commit; "fixed" = the commit pushed to the fork
+
+
+def _start_fixed_preview(run_id: str, commit_sha: str) -> Dict[str, Any]:
+    """Clone the fork at the pushed commit (stage 1, hardened clone) and run that copy."""
+    state, meta = RUNS_DB[run_id], RUN_META[run_id]
+    meta.setdefault("previews", {})["fixed"] = {"status": "cloning", "commit_sha": commit_sha, "label": "fixed"}
+    _persist(run_id)
+    resp = service_clients.run_launcher_stage(StageRunRequest(run_id=run_id, stage="clone", repo_url=state["repo_url"],
+                                                              commit_sha=commit_sha))
+    if resp.status != "success" or not resp.artifact_sha256:
+        raise ServiceError(f"could not clone the fixed commit: {resp.details.get('error') or resp.status}")
+    info = service_clients.start_preview(resp.artifact_sha256, f"fixed {commit_sha[:8]}")
+    meta["previews"]["fixed"] = {**info, "commit_sha": commit_sha, "source_sha256": resp.artifact_sha256}
+    _persist(run_id)
+    return meta["previews"]["fixed"]
+
+
+@app.post("/runs/{run_id}/previews")
+def start_run_preview(run_id: str, req: PreviewStartRequest):
+    """Run the app in a sandbox and open it at http://localhost:<port>: the original scanned commit, or the
+    fixed commit after an approved fix was pushed to the fork."""
+    if run_id not in RUNS_DB:
+        raise HTTPException(status_code=404, detail="Run not found")
+    state, meta = RUNS_DB[run_id], RUN_META[run_id]
+    current = (meta.get("previews") or {}).get(req.target)
+    if current and current.get("status") in ("cloning", "starting", "building", "running"):
+        return current
+    try:
+        if req.target == "fixed":
+            pushed = [c.get("pull_request") or {} for c in (meta.get("confirmations") or {}).values()]
+            commit = next((p.get("commit_sha") for p in reversed(pushed) if p.get("commit_sha")), None)
+            if not commit:
+                raise HTTPException(status_code=409, detail="no fix has been pushed to the fork yet")
+            return _start_fixed_preview(run_id, commit)
+        if not state.get("source_sha256"):
+            raise HTTPException(status_code=409, detail="the repo has not been cloned yet")
+        nodes._push(state["source_sha256"])
+        info = service_clients.start_preview(state["source_sha256"], f"original {(state.get('commit_sha') or '')[:8]}")
+        meta.setdefault("previews", {})["original"] = {**info, "commit_sha": state.get("commit_sha")}
+        _persist(run_id)
+        return meta["previews"]["original"]
+    except ServiceError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@app.get("/runs/{run_id}/previews")
+def list_run_previews(run_id: str):
+    """Both previews with live status and the last log lines."""
+    if run_id not in RUN_META:
+        raise HTTPException(status_code=404, detail="Run not found")
+    out = {}
+    for target, info in (RUN_META[run_id].get("previews") or {}).items():
+        if info.get("id"):
+            try:
+                live = service_clients.get_preview(info["id"])
+                info = {**info, **live}
+            except ServiceError as exc:
+                info = {**info, "status": info.get("status") if info.get("status") in ("stopped", "crashed") else "unknown",
+                        "error": info.get("error") or str(exc)[:200]}
+            RUN_META[run_id]["previews"][target] = {k: v for k, v in info.items() if k != "log"}
+        out[target] = info
+    return out
+
+
+@app.delete("/runs/{run_id}/previews/{target}")
+def stop_run_preview(run_id: str, target: str):
+    info = (RUN_META.get(run_id, {}).get("previews") or {}).get(target)
+    if not info:
+        raise HTTPException(status_code=404, detail="no such preview")
+    if info.get("id"):
+        try:
+            service_clients.stop_preview(info["id"])
+        except ServiceError:
+            pass
+    info["status"] = "stopped"
+    _persist(run_id)
+    return info
 
 
 # ------------------------------------------------------------------ verify on request

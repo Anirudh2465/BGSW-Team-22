@@ -7,6 +7,7 @@ import { useRun } from "../../../lib/run-context";
 import { Badge, Card, CardHeader, EmptyState, ScorePill, Stat } from "../../../components/ui";
 import { PipelineSteps, latestGates } from "../../../components/PipelineSteps";
 import { RepoHealthCard, type RepoHealthData } from "../../../components/RepoHealthCard";
+import { LiveAppPanel } from "../../../components/LiveAppPanel";
 import { parsePurl } from "../../../lib/utils";
 
 export default function OverviewPage() {
@@ -40,6 +41,8 @@ export default function OverviewPage() {
         </div>
 
         <RepoHealthCard health={run.repo_health as RepoHealthData | undefined} />
+
+        <LiveAppPanel run={run} />
 
         <Card className="overflow-hidden">
           <div className="flex flex-col gap-4 p-5 sm:flex-row sm:items-center sm:justify-between">

@@ -5,7 +5,8 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from guardian_contracts.api_schemas import StageRunRequest, StageRunResponse
 
 from . import artifacts
-from .docker_runner import DockerRunner
+from .docker_runner import DockerRunner, SandboxError
+from .preview import PreviewManager
 from .stages.stage1_clone import run_stage1_clone
 from .stages.stage2_resolve import run_stage2_resolve
 from .stages.stage3_scan import run_stage3_scan
@@ -13,6 +14,7 @@ from .stages.stage4_verify import run_stage4_verify
 
 app = FastAPI(title="Supply Chain Guardian - Launcher", version="0.2.0")
 runner = DockerRunner()
+previews = PreviewManager(runner)
 
 MAX_ARTIFACT_BYTES = 256 * 1024 * 1024
 
@@ -59,6 +61,42 @@ async def put_artifact(sha256: str, request: Request):
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"sha256": sha256, "size": len(body)}
+
+
+# ------------------------------------------------------------------- previews
+from pydantic import BaseModel  # noqa: E402
+
+
+class PreviewRequest(BaseModel):
+    source_artifact_sha256: str
+    label: str = "app"
+
+
+@app.post("/previews", dependencies=[Depends(require_token)])
+def start_preview(req: PreviewRequest):
+    """Build and run the repo in a sandbox; it is opened at http://localhost:<port> (127.0.0.1 only)."""
+    source = artifacts.artifact_store.get(req.source_artifact_sha256)
+    if source is None:
+        raise HTTPException(status_code=404, detail="source artifact not present on launcher")
+    try:
+        return previews.start(source, req.label[:40])
+    except SandboxError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@app.get("/previews/{preview_id}", dependencies=[Depends(require_token)])
+def get_preview(preview_id: str):
+    data = previews.get(preview_id)
+    if data is None:
+        raise HTTPException(status_code=404, detail="preview not found")
+    return data
+
+
+@app.delete("/previews/{preview_id}", dependencies=[Depends(require_token)])
+def stop_preview(preview_id: str):
+    if not previews.stop(preview_id):
+        raise HTTPException(status_code=404, detail="preview not found")
+    return {"status": "stopped"}
 
 
 # --------------------------------------------------------------------- stages

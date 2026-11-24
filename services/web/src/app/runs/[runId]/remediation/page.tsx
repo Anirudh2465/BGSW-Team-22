@@ -4,6 +4,7 @@ import React, { useState } from "react";
 import { Flag, Loader2, ShieldCheck } from "lucide-react";
 import { useRun } from "../../../../lib/run-context";
 import { ApprovalQueue } from "../../../../components/ApprovalQueue";
+import { LiveAppPanel } from "../../../../components/LiveAppPanel";
 import { Button } from "../../../../components/ui";
 import { finishRun } from "../../../../lib/api";
 
@@ -49,6 +50,9 @@ export default function RemediationPage() {
           )}
         </div>
         {error && <div className="mb-3 rounded-lg bg-rose-500/10 px-3 py-2 text-xs text-rose-300 ring-1 ring-rose-500/25">{error}</div>}
+        <div className="mb-4">
+          <LiveAppPanel run={run} />
+        </div>
         <ApprovalQueue run={run} findings={run.findings ?? {}} verdicts={run.policy_verdicts ?? {}} onDecided={reload} />
       </div>
     </div>

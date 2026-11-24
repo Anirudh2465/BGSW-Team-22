@@ -120,7 +120,12 @@ export function FindingActions({ run, findingId, onChanged, compact }: { run: Ru
             pull request <ExternalLink className="h-3 w-3" />
           </a>
         )}
-        {conf?.pull_request && !conf.pull_request.pr_url && conf.status === "passed" && (
+        {conf?.pull_request?.commit_url && (
+          <a href={conf.pull_request.commit_url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-emerald-300 hover:underline">
+            {conf.pull_request.status === "already_pushed" ? "already on" : "pushed to"} {conf.pull_request.branch ?? "main"} <ExternalLink className="h-3 w-3" />
+          </a>
+        )}
+        {conf?.pull_request && !conf.pull_request.pr_url && !conf.pull_request.commit_url && conf.status === "passed" && (
           <span className="text-ink-muted" title={conf.pull_request.reason ?? ""}>
             PR {conf.pull_request.status.replace(/_/g, " ")}
           </span>

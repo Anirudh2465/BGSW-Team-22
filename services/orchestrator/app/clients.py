@@ -28,7 +28,7 @@ from .config import config
 # Detection runs the SBOM vulnerability assessment (Grype + OSV-Scanner + feeds): give it real time.
 # > 2 x VULN_TOOL_TIMEOUT_S (600 s, tools run one after the other) + feed and artifact I/O.
 DETECT_TIMEOUT_S = float(os.getenv("DETECT_TIMEOUT_S", "1500"))
-PRIORITIZE_TIMEOUT_S = float(os.getenv("PRIORITIZE_TIMEOUT_S", "120"))
+PRIORITIZE_TIMEOUT_S = float(os.getenv("PRIORITIZE_TIMEOUT_S", "180"))
 POLICY_TIMEOUT_S = float(os.getenv("POLICY_TIMEOUT_S", "60"))
 REMEDIATE_TIMEOUT_S = float(os.getenv("REMEDIATE_TIMEOUT_S", "300"))
 REPORT_TIMEOUT_S = float(os.getenv("REPORT_TIMEOUT_S", "120"))
@@ -107,6 +107,30 @@ class ServiceClients:
             )
         timeout = config.STAGE_TIMEOUTS.get(req.stage, 600)
         return StageRunResponse(**self._post(f"{self.launcher_url}/stages/run", req.model_dump(), timeout))
+
+    # ---------------------------------------------------- live app previews
+    def _launcher(self, method: str, path: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        try:
+            with httpx.Client(timeout=60) as client:
+                res = client.request(method, f"{self.launcher_url}{path}", json=payload, headers=self._headers())
+        except httpx.HTTPError as exc:
+            raise ServiceError(f"launcher unreachable: {exc}") from exc
+        if res.status_code != 200:
+            try:
+                detail = res.json().get("detail")
+            except ValueError:
+                detail = res.text[:200]
+            raise ServiceError(f"launcher: {detail}")
+        return res.json()
+
+    def start_preview(self, source_sha256: str, label: str) -> Dict[str, Any]:
+        return self._launcher("POST", "/previews", {"source_artifact_sha256": source_sha256, "label": label})
+
+    def get_preview(self, preview_id: str) -> Dict[str, Any]:
+        return self._launcher("GET", f"/previews/{preview_id}")
+
+    def stop_preview(self, preview_id: str) -> Dict[str, Any]:
+        return self._launcher("DELETE", f"/previews/{preview_id}")
 
     def fetch_launcher_artifact(self, sha256: str) -> bytes:
         try:

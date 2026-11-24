@@ -251,10 +251,10 @@ def test_pr_is_idempotent_and_refuses_bad_inputs(key_file):
 
 def test_pr_not_configured_never_invents_a_url():
     patch = patch_bytes()
-    res = GitHubWriter(app_id="", key_path="").open_pull_request(
+    res = GitHubWriter(app_id="", key_path="", token="").open_pull_request(
         "https://github.com/org/app", COMMIT, patch, hashlib.sha256(patch).hexdigest(), "t", "b")
     assert res == {"status": "not_configured", "pr_url": None,
-                   "reason": "GITHUB_WRITER_APP_ID and the writer App private key are not configured"}
+                   "reason": "set GITHUB_TOKEN (fine-grained PAT for your fork) or the writer App credentials"}
 
 
 def test_pr_helpers(monkeypatch):
@@ -264,3 +264,43 @@ def test_pr_helpers(monkeypatch):
     assert target_repo("https://github.com/org/app") == "fork/app"
     text = pr_text("a" * 64, ["f1"], ["pkg:maven/x/y@2"], "secops-1", {"build_success": True, "warning": "no tests"})
     assert "secops-1" in text["body"] and "no tests" in text["body"] and text["title"].startswith("Upgrade")
+
+
+def test_pat_pushes_one_commit_to_the_forks_main_and_is_idempotent():
+    files = {"main": POM}
+    calls = []
+
+    def gh(req: httpx.Request) -> httpx.Response:
+        path, m = req.url.path, req.method
+        calls.append((m, path, req.headers.get("authorization")))
+        if path == "/repos/me/app":
+            return httpx.Response(200, json={"default_branch": "main"})
+        if path == "/repos/me/app/git/ref/heads/main":
+            return httpx.Response(200, json={"object": {"sha": "h" * 40}})
+        if path == "/repos/me/app/contents/pom.xml":
+            text = POM if req.url.params.get("ref") == COMMIT else files["main"]
+            return httpx.Response(200, json={"content": base64.b64encode(text.encode()).decode()})
+        if path == "/repos/me/app/git/commits/" + "h" * 40:
+            return httpx.Response(200, json={"tree": {"sha": "t0"}})
+        if path == "/repos/me/app/git/blobs":
+            files["pending"] = json.loads(req.content)["content"]
+            return httpx.Response(201, json={"sha": "b1"})
+        if path == "/repos/me/app/git/trees":
+            return httpx.Response(201, json={"sha": "t1"})
+        if path == "/repos/me/app/git/commits":
+            assert json.loads(req.content)["parents"] == ["h" * 40]
+            return httpx.Response(201, json={"sha": "c" * 40})
+        if path == "/repos/me/app/git/refs/heads/main" and m == "PATCH":
+            assert json.loads(req.content)["force"] is False          # fast-forward only
+            files["main"] = files["pending"]
+            return httpx.Response(200, json={})
+        return httpx.Response(404, json={"path": path})
+
+    patch = patch_bytes()
+    w = GitHubWriter(app_id="", key_path="", token="pat-123", mode="direct", transport=httpx.MockTransport(gh))
+    res = w.open_pull_request("https://github.com/me/app", COMMIT, patch, hashlib.sha256(patch).hexdigest(), "t", "b")
+    assert res["status"] == "pushed" and res["commit_url"] == "https://github.com/me/app/commit/" + "c" * 40
+    assert "<version>2.25.4</version>" in files["main"]
+    assert all(a == "Bearer pat-123" for _, _, a in calls)
+    again = w.open_pull_request("https://github.com/me/app", COMMIT, patch, hashlib.sha256(patch).hexdigest(), "t", "b")
+    assert again["status"] == "already_pushed"                                 # never pushed twice

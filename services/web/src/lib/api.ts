@@ -45,7 +45,7 @@ export interface Confirmation {
   finished_at?: string;
   failed?: string[];
   checks?: { name: string; passed: boolean; detail?: unknown }[];
-  pull_request?: { status: string; pr_url?: string | null; reason?: string | null };
+  pull_request?: { status: string; pr_url?: string | null; reason?: string | null; commit_sha?: string | null; commit_url?: string | null; branch?: string | null };
 }
 
 export interface AssistRecord {
@@ -420,6 +420,29 @@ export async function fetchVerifyLog(runId: string, bundleSha256: string, step: 
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return res.text();
 }
+
+export interface PreviewInfo {
+  id?: string;
+  label?: string;
+  port?: number;
+  url?: string;
+  status: string;
+  error?: string | null;
+  started_at?: number;
+  expires_at?: number;
+  commit_sha?: string;
+  database?: { kind: string; database: string; user: string } | null;
+  log?: string;
+}
+
+/** Live app previews of a run: "original" (scanned commit) and "fixed" (commit pushed to the fork). */
+export const fetchPreviews = (runId: string) => request<Record<string, PreviewInfo>>(`/runs/${encodeURIComponent(runId)}/previews`);
+
+export const startPreview = (runId: string, target: "original" | "fixed") =>
+  request<PreviewInfo>(`/runs/${encodeURIComponent(runId)}/previews`, { method: "POST", body: JSON.stringify({ target }) });
+
+export const stopPreview = (runId: string, target: "original" | "fixed") =>
+  request<PreviewInfo>(`/runs/${encodeURIComponent(runId)}/previews/${target}`, { method: "DELETE" });
 
 /** The exact patch (unified diff) a remediation refers to, by its SHA-256. */
 export async function fetchPatch(runId: string, patchSha256: string): Promise<string> {

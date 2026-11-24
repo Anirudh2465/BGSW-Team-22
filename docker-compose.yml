@@ -40,6 +40,12 @@ services:
       - SANDBOX_IMAGE_DIGEST_RESOLVE=${SANDBOX_IMAGE_DIGEST_RESOLVE:-}
       - SANDBOX_IMAGE_DIGEST_SCAN=${SANDBOX_IMAGE_DIGEST_SCAN:-}
       - SANDBOX_IMAGE_DIGEST_VERIFY=${SANDBOX_IMAGE_DIGEST_VERIFY:-}
+      # Live app previews: the launcher forwards these to the app inside its sandbox network (localhost only).
+      - PREVIEW_PORTS=18080,18081
+      - PREVIEW_TTL_S=${PREVIEW_TTL_S:-1800}
+    ports:
+      - "127.0.0.1:18080:18080"
+      - "127.0.0.1:18081:18081"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - launcher_artifacts:/var/lib/guardian/artifacts
@@ -118,6 +124,9 @@ services:
     restart: unless-stopped
     environment:
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      # Push approved fixes to your fork: fine-grained PAT (Contents: read and write on the fork only)
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      - GITHUB_PUSH_MODE=${GITHUB_PUSH_MODE:-direct}
       - GEMINI_MODEL=${GEMINI_MODEL:-gemini-3.8-flash}
       - GEMINI_FALLBACK_MODEL=${GEMINI_FALLBACK_MODEL:-gemini-3.5-flash}
       - GITHUB_WRITER_APP_ID=${GITHUB_WRITER_APP_ID:-}

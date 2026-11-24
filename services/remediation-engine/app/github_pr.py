@@ -60,14 +60,18 @@ def target_repo(repo_url: str) -> Optional[str]:
 
 class GitHubWriter:
     def __init__(self, app_id: Optional[str] = None, key_path: Optional[str] = None,
-                 transport: Optional[httpx.BaseTransport] = None):
+                 transport: Optional[httpx.BaseTransport] = None, token: Optional[str] = None,
+                 mode: Optional[str] = None):
         self.app_id = app_id if app_id is not None else os.getenv("GITHUB_WRITER_APP_ID", "")
         self.key_path = key_path if key_path is not None else os.getenv("GITHUB_WRITER_PRIVATE_KEY_PATH", "")
         self.transport = transport
+        # fine-grained personal access token for the user's fork; takes precedence over the writer App
+        self.token = token if token is not None else os.getenv("GITHUB_TOKEN", "")
+        self.mode = (mode if mode is not None else os.getenv("GITHUB_PUSH_MODE", "direct")).strip().lower()
 
     @property
     def configured(self) -> bool:
-        return bool(self.app_id and self.key_path and os.path.isfile(self.key_path))
+        return bool(self.token) or bool(self.app_id and self.key_path and os.path.isfile(self.key_path))
 
     def _client(self, token: Optional[str] = None) -> httpx.Client:
         headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28",
@@ -83,6 +87,8 @@ class GitHubWriter:
         return res.json() if res.content else {}
 
     def _installation_token(self, repo: str) -> str:
+        if self.token:
+            return self.token
         with open(self.key_path, "rb") as fh:
             jwt = app_jwt(self.app_id, fh.read())
         with self._client(jwt) as c:
@@ -96,13 +102,15 @@ class GitHubWriter:
             raise PullRequestError("patch bytes do not match the approved patch_sha256")
         if not self.configured:
             return {"status": "not_configured", "pr_url": None,
-                    "reason": "GITHUB_WRITER_APP_ID and the writer App private key are not configured"}
+                    "reason": "set GITHUB_TOKEN (fine-grained PAT for your fork) or the writer App credentials"}
         repo = target_repo(repo_url)
         if not repo:
             return {"status": "unsupported_repo", "pr_url": None, "reason": f"not a GitHub repository: {repo_url}"}
         if not re.fullmatch(r"[0-9a-f]{40}", commit_sha or ""):
             raise PullRequestError("the scanned commit SHA is required to base the branch on")
         diff = patch.decode("utf-8")
+        if self.token and self.mode == "direct":
+            return self.push_to_default_branch(repo, commit_sha, diff, patch_sha256, title, body)
         branch = f"guardian/fix-{patch_sha256[:12]}"
         token = self._installation_token(repo)
         with self._client(token) as c:
@@ -137,6 +145,52 @@ class GitHubWriter:
                 "title": title, "head": branch, "base": meta.get("default_branch", "main"), "body": body}),
                 "open pull request")
         return {"status": "opened", "pr_url": pr["html_url"], "branch": branch, "repo": repo}
+
+
+    def push_to_default_branch(self, repo: str, scanned_commit: str, diff: str, patch_sha256: str,
+                               title: str, body: str) -> Dict[str, Any]:
+        """One commit on the fork's default branch with the approved patch (Git Data API, fast-forward only).
+        Idempotent: if the branch already holds the patched files, nothing is pushed and its head is returned.
+        If the default branch changed those lines since the scan, the patch does not apply and nothing is pushed."""
+        with self._client(self.token) as c:
+            meta = self._check(c.get(f"/repos/{repo}"), "repository (check the token's repository access)")
+            branch = meta.get("default_branch", "main")
+            ref = self._check(c.get(f"/repos/{repo}/git/ref/heads/{branch}"), f"branch {branch}")
+            head = ref["object"]["sha"]
+            paths = re.findall(r"^\+\+\+ b/(.+)$", diff, re.M)
+            scanned: Dict[str, str] = {}
+            current: Dict[str, str] = {}
+            for path in paths:
+                f = self._check(c.get(f"/repos/{repo}/contents/{path}", params={"ref": scanned_commit}), f"read {path}")
+                scanned[path] = base64.b64decode(f["content"]).decode("utf-8")
+                g = self._check(c.get(f"/repos/{repo}/contents/{path}", params={"ref": head}), f"read {path} on {branch}")
+                current[path] = base64.b64decode(g["content"]).decode("utf-8")
+            try:
+                target = apply(scanned, diff)
+            except PatchError as exc:
+                raise PullRequestError(f"patch does not apply to the scanned commit: {exc}") from exc
+            if all(current[p] == target[p] for p in target):
+                return {"status": "already_pushed", "pr_url": None, "commit_sha": head, "branch": branch, "repo": repo,
+                        "commit_url": f"https://github.com/{repo}/commit/{head}"}
+            try:
+                new_files = apply(current, diff)   # the same edit on today's branch head
+            except PatchError as exc:
+                raise PullRequestError(f"{branch} changed these lines since the scan; rescan the fork: {exc}") from exc
+            base = self._check(c.get(f"/repos/{repo}/git/commits/{head}"), "head commit")
+            tree = []
+            for path, text in sorted(new_files.items()):
+                blob = self._check(c.post(f"/repos/{repo}/git/blobs", json={"content": text, "encoding": "utf-8"}),
+                                   f"blob {path}")
+                tree.append({"path": path, "mode": "100644", "type": "blob", "sha": blob["sha"]})
+            new_tree = self._check(c.post(f"/repos/{repo}/git/trees", json={"base_tree": base["tree"]["sha"],
+                                                                           "tree": tree}), "tree")
+            commit = self._check(c.post(f"/repos/{repo}/git/commits", json={
+                "message": f"fix(deps): {title}\n\n{body}\n\nSupply Chain Guardian verified patch {patch_sha256}",
+                "tree": new_tree["sha"], "parents": [head]}), "commit")
+            self._check(c.patch(f"/repos/{repo}/git/refs/heads/{branch}", json={"sha": commit["sha"], "force": False}),
+                        f"update {branch} (fast-forward only)")
+        return {"status": "pushed", "pr_url": None, "commit_sha": commit["sha"], "branch": branch, "repo": repo,
+                "commit_url": f"https://github.com/{repo}/commit/{commit['sha']}"}
 
 
 def pr_text(patch_sha256: str, finding_ids: List[str], targets: List[str], approved_by: str,

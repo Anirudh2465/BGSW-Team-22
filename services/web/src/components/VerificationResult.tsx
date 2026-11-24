@@ -21,7 +21,12 @@ export function Check({ ok, label, detail }: { ok: boolean | null | undefined; l
   );
 }
 
-export function testsLine(s4: Dict) {
+/** The verifier judges pre-existing failures against the health check; older runs set it on the sandbox result. */
+function preexisting(s4: Dict, ver?: Dict) {
+  return !!(s4?.tests_preexisting_failures || (ver?.tests_preexisting_failures && !(ver.new_test_failures ?? []).length));
+}
+
+export function testsLine(s4: Dict, ver?: Dict) {
   if (!s4 || !s4.status) return { ok: null, label: "Tests", detail: "not run yet" };
   if (s4.status === "error" || s4.build_success === false) return { ok: null, label: "Tests", detail: "not run (the build did not complete)" };
   if (s4.tests_found === false) return { ok: null, label: "Tests: none found", detail: "the project has no tests" };
@@ -31,7 +36,7 @@ export function testsLine(s4: Dict) {
   ) as Dict;
   const counts = totals.tests ? `${totals.tests} run, ${totals.failures} failed` : undefined;
   const newFailures = Object.values((s4.tests ?? {}) as Dict).flatMap((t: any) => t?.baseline?.new_failures ?? []);
-  if (s4.tests_success === false && s4.tests_preexisting_failures)
+  if (s4.tests_success === false && preexisting(s4, ver))
     return { ok: true, label: "Tests: no new failures", detail: `${counts ?? "failing tests"}; the same tests fail without the patch (pre-existing)` };
   if (s4.tests_success === false)
     return { ok: false, label: "Tests failed", detail: [counts, newFailures.length ? `caused by the patch: ${newFailures.slice(0, 5).join(", ")}` : null].filter(Boolean).join(" · ") || undefined };
@@ -44,7 +49,7 @@ export function rootCause(s4: Dict, rs: Dict, ver: Dict): string | null {
   if (s4.status === "error") return `Verification could not run: ${s4.error ?? "unknown error"}`;
   if (s4.patch_applied === false) return "The patch did not apply to a clean checkout of the scanned commit";
   if (s4.build_success === false) return s4.error ? `Build failed (${String(s4.error).replace(/^build failed:\s*/, "")})` : "Build failed";
-  if (s4.tests_success === false && !s4.tests_preexisting_failures) return "Tests failed with the patch applied";
+  if (s4.tests_success === false && !preexisting(s4, ver)) return "Tests failed with the patch applied";
   if (s4.resolved_version_matches === false) {
     const c = (s4.resolved_checks ?? []).find((x: Dict) => !x.matches);
     return c ? `Resolved ${(c.resolved_versions ?? []).join(", ") || "nothing"} instead of ${c.target_version}` : "The target version did not resolve";
@@ -112,7 +117,7 @@ function stepLabel(name: string) {
 /** One verification attempt: root cause, the checks, and every sandbox step (click a step for its log). */
 export function VerificationChecks({ runId, findingId, s4, rs, ver, target }: { runId: string; findingId: string; s4: Dict; rs: Dict; ver: Dict; target?: string | null }) {
   const [openStep, setOpenStep] = useState<string | null>(null);
-  const tests = testsLine(s4);
+  const tests = testsLine(s4, ver);
   const targetRows: Dict[] = (rs?.targets ?? []).filter((t: Dict) => t.finding_id === findingId);
   const newBlocking: Dict[] = (rs?.new_advisories ?? []).filter((a: Dict) => a.risk_band === "Critical" || a.risk_band === "High");
   const ran = !!s4?.status && s4.status !== "error";

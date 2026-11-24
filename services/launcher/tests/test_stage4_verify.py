@@ -521,3 +521,15 @@ def test_script_has_the_standard_suite():
     assert "baseline.revert" not in VERIFY_SCRIPT                        # the health check replaces the revert pass
     assert junit_failing({"a": surefire_cases("A#x", "B#y")}) == ["A#x", "B#y"]
     assert parse_startup("garbage")["status"] == "unknown"
+
+
+def test_preview_detects_the_database_and_its_credentials():
+    from app.preview import _sql_files, detect_database
+    members = {"pom.xml": b"<dependency><artifactId>mysql-connector-j</artifactId></dependency>",
+               "src/main/resources/application.properties":
+                   b"spring.datasource.url=jdbc:mysql://localhost:3306/ecommjava\n"
+                   b"spring.datasource.username=root\nspring.datasource.password=secret\n",
+               "basedata.sql": b"CREATE TABLE x (id int);", "docs/other.sql": b"--"}
+    assert detect_database(members) == {"kind": "mysql", "database": "ecommjava", "user": "root", "password": "secret"}
+    assert list(_sql_files(members)) == ["basedata.sql"]                   # root-level seed files only
+    assert detect_database({"pom.xml": b"<artifactId>spring-boot-starter-web</artifactId>"}) is None
