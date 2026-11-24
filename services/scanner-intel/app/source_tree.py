@@ -34,8 +34,11 @@ MANIFESTS = {
 
 AGENT_CONFIG_FILES = {
     ".cursorrules", ".windsurfrules", ".clinerules", "CLAUDE.md", "AGENTS.md", "GEMINI.md",
-    ".mcp.json", "mcp.json", ".github/copilot-instructions.md",
+    ".mcp.json", "mcp.json", ".github/copilot-instructions.md", ".claude/settings.json", ".gemini/settings.json",
 }
+# Directories whose files are all agent instructions or MCP configs.
+AGENT_CONFIG_DIRS = (".cursor/rules/", ".windsurf/rules/", ".clinerules/", ".github/instructions/",
+                     ".github/prompts/", ".claude/commands/", ".claude/agents/", ".cursor/mcp", ".vscode/mcp")
 
 LANGUAGE_BY_EXT = {
     ".java": "Java", ".kt": "Kotlin", ".kts": "Kotlin", ".scala": "Scala", ".groovy": "Groovy",
@@ -176,8 +179,9 @@ class SourceTree:
                      or posixpath.basename(p).startswith("docker-compose"))]
 
     def agent_config_files(self) -> List[str]:
-        return [p for p in self.paths if p in AGENT_CONFIG_FILES or posixpath.basename(p) in AGENT_CONFIG_FILES
-                or p.startswith(".cursor/rules/")]
+        return [p for p in self.paths if not is_vendored(p) and (
+            p in AGENT_CONFIG_FILES or posixpath.basename(p) in AGENT_CONFIG_FILES
+            or any(p.startswith(d) or ("/" + d) in p for d in AGENT_CONFIG_DIRS))]
 
     def readme(self) -> Optional[str]:
         for candidate in ("README.md", "README.rst", "README.txt", "README"):

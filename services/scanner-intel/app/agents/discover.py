@@ -90,6 +90,9 @@ class DiscoverAgent:
         skipped = sorted(e for e, s in coverage.items() if s == "skipped")
         gate_passed = not skipped and source.report.readable
 
+        image_meta = self._images(run_id, bundle, errors)
+        if image_meta["containers"]:
+            result.sbom.setdefault("components", []).extend(image_meta["containers"])
         sbom_bytes = canonical_json(result.sbom)
         try:
             sbom_sha256 = artifacts.artifact_client.put(run_id, "discover", CYCLONEDX_MEDIA_TYPE, sbom_bytes)
@@ -103,6 +106,8 @@ class DiscoverAgent:
         class_meta = self._class_graph(run_id, bundle, scanner_status, errors)
         if class_meta:
             artifacts_meta["class_graph"] = class_meta
+        if image_meta["images"]:
+            artifacts_meta["image_sboms"] = image_meta["images"]
 
         graph.graph["metrics"].update({
             "detected_ecosystems": detected,
@@ -110,6 +115,7 @@ class DiscoverAgent:
             "scanner_status": scanner_status,
             "resolver_trees": sorted(t.source for t in trees),
             "errors": errors,
+            "image_notes": image_meta["notes"],
         })
         graph.graph["sbom_sha256"] = sbom_sha256
         graph.graph["schema"] = PACKAGE_GRAPH_SCHEMA
@@ -248,6 +254,60 @@ class DiscoverAgent:
             "status": meta.get("status"), "classes": m.get("classes", 0), "edges": m.get("internal_edges", 0),
             "packages": m.get("packages", 0), "cycles": m.get("cycles", 0), "size": len(content),
         }
+
+    def _images(self, run_id: str, bundle: Dict[str, bytes], errors: List[str]) -> Dict[str, Any]:
+        """Base images scanned in stage 2: store each image SBOM and Cosign record as its own artifact and
+        describe the image as a CycloneDX ``container`` component of the merged SBOM.
+
+        The container component carries no purl, so the application CVE assessment ignores it; the
+        detector assesses each image from its own SBOM (``guardian:image_sbom_sha256``). Image packages
+        are kept out of the dependency graph so OS packages do not flood it.
+        """
+        index = parsers.load_json(bundle.get("resolved/images/index.json", b"")) or {}
+        containers: List[Dict[str, Any]] = []
+        images: List[Dict[str, Any]] = []
+        for entry in (index.get("images") or []) if isinstance(index, dict) else []:
+            if not isinstance(entry, dict) or not entry.get("ref"):
+                continue
+            ref = str(entry["ref"])
+            props = {"guardian:image_ref": ref, "guardian:image_status": str(entry.get("status") or "unknown")}
+            meta: Dict[str, Any] = {"ref": ref, "status": props["guardian:image_status"]}
+            if entry.get("digest"):
+                props["guardian:image_digest"] = str(entry["digest"])
+                meta["digest"] = props["guardian:image_digest"]
+            if entry.get("error"):
+                props["guardian:image_error"] = str(entry["error"])[:300]
+            raw_sbom = bundle.get(str(entry.get("sbom") or ""), b"")
+            if raw_sbom:
+                try:
+                    sha = artifacts.artifact_client.put(run_id, "discover", CYCLONEDX_MEDIA_TYPE, raw_sbom)
+                    props["guardian:image_sbom_sha256"] = sha
+                    data = parsers.load_json(raw_sbom) or {}
+                    meta.update({"sha256": sha, "components": len(data.get("components") or [])})
+                except ArtifactError as exc:
+                    errors.append(f"could not store image SBOM for {ref}: {exc}")
+            raw_cosign = bundle.get(str(entry.get("cosign") or ""), b"")
+            cosign = parsers.load_json(raw_cosign) if raw_cosign else None
+            if isinstance(cosign, dict):
+                props["guardian:cosign_status"] = str(cosign.get("status") or "not_checked")
+                props["guardian:cosign_identities"] = canonical_json(cosign.get("signatures") or []).decode()
+                meta["cosign"] = props["guardian:cosign_status"]
+                try:
+                    props["guardian:cosign_sha256"] = artifacts.artifact_client.put(run_id, "discover",
+                                                                                    JSON_MEDIA_TYPE, raw_cosign)
+                except ArtifactError as exc:
+                    errors.append(f"could not store cosign result for {ref}: {exc}")
+            name, version = ref.split("@", 1)[0], props.get("guardian:image_digest", "")
+            if ":" in name.rsplit("/", 1)[-1]:
+                name, tag = name.rsplit(":", 1)
+                version = version or tag
+            containers.append({
+                "type": "container", "bom-ref": f"image:{ref}", "name": name, "version": version or "latest",
+                "properties": [{"name": k, "value": v} for k, v in sorted(props.items())],
+            })
+            images.append(meta)
+        notes = [str(n) for n in (index.get("notes") or [])[:10]] if isinstance(index, dict) else []
+        return {"containers": containers, "images": images, "notes": notes}
 
     @staticmethod
     def _failed(run_id: str, reason: str) -> DiscoverResponse:

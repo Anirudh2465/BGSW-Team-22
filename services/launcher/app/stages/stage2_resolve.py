@@ -19,7 +19,9 @@ from ..docker_runner import DockerRunner, EgressConfig, SandboxError
 from ..proxy.egress_proxy import EgressProxy
 from ..proxy.sinkhole import SinkholeLogger
 from ..tarballs import build_tar, read_members
+from ..allowlist import IMAGE_REGISTRY_DOMAINS, SIGSTORE_DOMAINS
 from .common import detect_build_ecosystems, sandbox_output_files, tail
+from .images import IMAGE_SCAN_ENABLED, IMAGE_SCRIPT, base_images, image_index
 
 RESOLVE_TIMEOUT_S = int(os.getenv("STAGE2_TIMEOUT_S", "1200"))
 MAVEN_DEPENDENCY_PLUGIN = "org.apache.maven.plugins:maven-dependency-plugin:3.8.1:tree"
@@ -103,7 +105,7 @@ if has npm && [ "$GUARDIAN_OBSERVE_HOOKS" = "1" ]; then
     echo "hooks observed $(modname "$d")" >> "$STATUS"
   done
 fi
-
+""" + IMAGE_SCRIPT + r"""
 tar -cf - -C /workspace/out . >&3
 """
 
@@ -134,13 +136,17 @@ def run_stage2_resolve(run_id: str, source_sha256: str, parameters: Dict[str, An
         return {"status": "error", "error": f"source artifact {source_sha256} not present on launcher",
                 "metrics": {}}
 
-    paths = list(read_members(source).keys())
+    members = read_members(source)
+    paths = list(members.keys())
     ecosystems: List[str] = detect_build_ecosystems(paths)
+    scan_images = IMAGE_SCAN_ENABLED and bool(parameters.get("scan_images", True))
+    images, image_notes = base_images(members) if scan_images else ([], [])
     observe_hooks = bool(parameters.get("observe_hooks", "npm" in ecosystems))
     unsupported = [e for e in ecosystems if e not in ("maven", "npm", "pypi")]
 
     sinkhole = SinkholeLogger()
-    allow_proxy = EgressProxy(mode="allowlist")
+    allow_proxy = EgressProxy(mode="allowlist",
+                              extra_domains=(IMAGE_REGISTRY_DOMAINS + SIGSTORE_DOMAINS) if images else ())
     sink_proxy = EgressProxy(mode="sinkhole", sinkhole=sinkhole)
     allow_port, sink_port = allow_proxy.start(), sink_proxy.start()
     try:
@@ -152,6 +158,7 @@ def run_stage2_resolve(run_id: str, source_sha256: str, parameters: Dict[str, An
                 "GUARDIAN_ECOSYSTEMS": " ".join(ecosystems),
                 "GUARDIAN_OBSERVE_HOOKS": "1" if observe_hooks else "0",
                 "GUARDIAN_MAVEN_PLUGIN": MAVEN_DEPENDENCY_PLUGIN,
+                "GUARDIAN_IMAGES": "\n".join(images),
             },
             egress=EgressConfig(allowlist_port=allow_port, sinkhole_port=sink_port),
             timeout_s=RESOLVE_TIMEOUT_S,
@@ -167,7 +174,9 @@ def run_stage2_resolve(run_id: str, source_sha256: str, parameters: Dict[str, An
     for eco in unsupported:
         status[eco] = {"root": "unsupported"}
 
-    tree_files = {p: (data, False) for p, data in out.items() if p.startswith("resolved/") and p.endswith(".json")}
+    tree_files = {p: (data, False) for p, data in out.items()
+                  if p.startswith("resolved/") and p.endswith(".json") and not p.startswith("resolved/images/")}
+    tree_files.update(image_index(out, images, status, image_notes))
     status_doc = {"ecosystems": ecosystems, "status": status, "source_sha256": source_sha256,
                   "exit_code": result.exit_code, "timed_out": result.timed_out}
     tree_files["resolved/status.json"] = (json.dumps(status_doc, sort_keys=True, indent=1).encode(), False)
@@ -189,6 +198,7 @@ def run_stage2_resolve(run_id: str, source_sha256: str, parameters: Dict[str, An
         "hook_anomalies_detected": sinkhole.has_anomalies(),
         "resolved_ecosystems": ecosystems,
         "resolve_status": status,
+        "image_notes": image_notes,
         "stderr_tail": tail(result.stderr),
         "metrics": {
             "proxy_requests": len(egress_log),
@@ -196,6 +206,8 @@ def run_stage2_resolve(run_id: str, source_sha256: str, parameters: Dict[str, An
             "egress_domains_hit": sorted({r["target_host"] for r in egress_log if r["allowed"]}),
             "anomalies_count": len(sinkhole.sinkhole_events),
             "tree_files": len(tree_files) - 1,
+            "images_requested": len(images),
+            "images_scanned": sum(1 for v in (status.get("images") or {}).values() if v == "ok"),
             "duration_ms": result.duration_ms,
         },
     }
