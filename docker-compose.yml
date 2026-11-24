@@ -119,6 +119,7 @@ services:
     environment:
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - GEMINI_MODEL=${GEMINI_MODEL:-gemini-3.8-flash}
+      - GEMINI_FALLBACK_MODEL=${GEMINI_FALLBACK_MODEL:-gemini-3.5-flash}
       - GITHUB_WRITER_APP_ID=${GITHUB_WRITER_APP_ID:-}
       - GITHUB_WRITER_PRIVATE_KEY_PATH=${GITHUB_WRITER_PRIVATE_KEY_PATH:-/secrets/writer.pem}
       - LAUNCHER_URL=http://launcher:8001

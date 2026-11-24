@@ -190,7 +190,8 @@ class PrioritizerAgent:
             stats.update(status="transcript_not_stored", grounded=0, fallback=len(facts))
             stats["errors"].append(f"transcript: {type(exc).__name__}")
             return {}, None
-        evidence = Evidence(id=f"gemini:{gemini.model}:explanation", tool=GEMINI_TOOL, artifact_sha256=transcript_sha)
+        used = getattr(gemini, "last_model", None) or gemini.model
+        evidence = Evidence(id=f"gemini:{used}:explanation", tool=GEMINI_TOOL, artifact_sha256=transcript_sha)
         return {fid: render(s) for fid, s in accepted.items()}, evidence
 
 

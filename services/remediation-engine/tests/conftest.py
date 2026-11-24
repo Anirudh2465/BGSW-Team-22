@@ -11,4 +11,5 @@ def _no_live_gemini(monkeypatch):
     """Tests never call the real Gemini API; they inject recorded responses through httpx.MockTransport.
     The opt-in live test reads LIVE_GEMINI_KEY explicitly."""
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.setenv("REMEDIATION_REGISTRY_OFFLINE", "true")  # registry data is injected via MockTransport
     monkeypatch.setattr("app.llm.gemini_adapter.RETRY_DELAY_S", 0, raising=False)

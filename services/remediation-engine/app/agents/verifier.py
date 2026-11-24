@@ -15,6 +15,10 @@ class VerifierAgent:
         all_passed = True
 
         for rem in remediations:
+            if rem.state != "draft" or not rem.patch_sha256:
+                # no_safe_fix / escalated: nothing to build; they skip approval and go to the report
+                verified_list.append(rem)
+                continue
             # Call Launcher Stage 4 or simulate offline sandbox verification
             try:
                 with httpx.Client(timeout=1.0) as client:
@@ -41,6 +45,7 @@ class VerifierAgent:
 
             updated_rem = rem.model_copy(update={
                 "validation": {
+                    **(rem.validation or {}),  # keep the remediator's candidate and selection records
                     "build_passed": build_ok,
                     "tests_passed": test_ok,
                     "rescan_passed": rescan_ok
