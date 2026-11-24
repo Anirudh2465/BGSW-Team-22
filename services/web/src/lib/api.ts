@@ -324,6 +324,44 @@ export const fetchClassGraph = (runId: string) => request<ClassGraph>(`/runs/${e
 export const artifactDownloadUrl = (runId: string, name: string) =>
   `${ORCHESTRATOR_URL}/runs/${encodeURIComponent(runId)}/artifacts/${encodeURIComponent(name)}`;
 
+export const reportExportUrl = (runId: string, format: string) =>
+  `${ORCHESTRATOR_URL}/runs/${encodeURIComponent(runId)}/reports/export/${encodeURIComponent(format)}`;
+
+export interface GenerateReportPayload {
+  format: "html" | "pdf" | "markdown" | "sarif" | "vex" | "csv";
+  config?: {
+    scope?: "full" | "critical_high_only" | "verified_fixes_only";
+    min_score?: number;
+    risk_bands?: string[];
+    include_remediations_only?: boolean;
+    include_raw_evidence?: boolean;
+    include_audit_trail?: boolean;
+    environment?: string;
+  };
+  custom_title?: string;
+  notes?: string;
+}
+
+export interface GenerateReportResult {
+  run_id: string;
+  report_id: string;
+  format: string;
+  artifact_sha256: string;
+  filename: string;
+  content_type: string;
+  download_url: string;
+  generated_at: string;
+  summary_metrics: Record<string, number>;
+  gate_passed: boolean;
+  content_text?: string;
+}
+
+export const generateReport = (runId: string, payload: GenerateReportPayload) =>
+  request<GenerateReportResult>(`/runs/${encodeURIComponent(runId)}/reports/generate`, {
+    method: "POST",
+    body: JSON.stringify({ run_id: runId, ...payload }),
+  });
+
 export const fetchHealth = () => request<OrchestratorHealth>("/health");
 
 export const sbomDownloadUrl =(runId: string) => `${ORCHESTRATOR_URL}/runs/${encodeURIComponent(runId)}/sbom`;

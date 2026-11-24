@@ -14,6 +14,9 @@ from guardian_contracts.api_schemas import (
     RunResponse,
     ApprovalRequest,
     ApprovalResponse,
+    GenerateReportRequest,
+    GenerateReportResponse,
+    ReportFormat,
 )
 from guardian_contracts.state import GuardianState, Approval, Remediation
 from pydantic import BaseModel
@@ -376,6 +379,79 @@ def download_run_artifact(run_id: str, name: str):
         "Content-Disposition": f'attachment; filename="{run_id}.{meta["filename"]}"',
         "X-Artifact-SHA256": meta["sha256"],
     })
+
+
+@app.post("/runs/{run_id}/reports/generate", response_model=GenerateReportResponse)
+def generate_run_report(run_id: str, req: GenerateReportRequest):
+    if run_id not in RUNS_DB:
+        raise HTTPException(status_code=404, detail="Run not found")
+    state = RUNS_DB[run_id]
+    findings = list(state.get("findings", {}).values())
+    policy_verdicts = state.get("policy_verdicts", {})
+    remediations = list(state.get("remediations", {}).values())
+    approvals = list(state.get("approvals", {}).values())
+    audit_head = audit_chain.get_chain_head()
+    repo_url = state.get("repo_url", "https://github.com/example/repository")
+    commit_sha = state.get("commit_sha", "HEAD")
+
+    engine_payload = {
+        "request": req.model_dump(),
+        "findings": [f.model_dump() for f in findings],
+        "policy_verdicts": policy_verdicts,
+        "remediations": [r.model_dump() for r in remediations],
+        "approvals": [a.model_dump() for a in approvals],
+        "audit_chain_head": audit_head,
+        "repo_url": repo_url,
+        "commit_sha": commit_sha,
+    }
+
+    res_data = service_clients.call_generate_report(engine_payload)
+    content_text = res_data.get("content_text") or ""
+    content_bytes = content_text.encode("utf-8")
+
+    # Store in artifact store
+    if content_bytes and res_data.get("artifact_sha256"):
+        artifact_store.put(res_data["artifact_sha256"], content_bytes)
+
+    # Append event to audit chain if available
+    try:
+        audit_chain.append_event(
+            run_id=run_id,
+            stage="reporting",
+            data={
+                "event": "custom_report_generated",
+                "format": req.format.value,
+                "report_sha256": res_data["artifact_sha256"],
+                "report_id": res_data["report_id"]
+            }
+        )
+    except Exception:
+        pass
+
+    return GenerateReportResponse(**res_data)
+
+
+@app.get("/runs/{run_id}/reports/export/{format}")
+def export_run_report(run_id: str, format: str):
+    if run_id not in RUNS_DB:
+        raise HTTPException(status_code=404, detail="Run not found")
+    try:
+        report_fmt = ReportFormat(format.lower())
+    except ValueError:
+        report_fmt = ReportFormat.MARKDOWN
+
+    req = GenerateReportRequest(run_id=run_id, format=report_fmt)
+    gen_res = generate_run_report(run_id, req)
+    content_bytes = (gen_res.content_text or "").encode("utf-8")
+
+    return Response(
+        content=content_bytes,
+        media_type=gen_res.content_type,
+        headers={
+            "Content-Disposition": f'inline; filename="{gen_res.filename}"',
+            "X-Report-SHA256": gen_res.artifact_sha256,
+        }
+    )
 
 
 @app.get("/runs/{run_id}/class-graph")

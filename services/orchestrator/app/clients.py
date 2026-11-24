@@ -325,4 +325,24 @@ class ServiceClients:
                 gate_passed=True
             )
 
+    def call_generate_report(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """On-demand report generation routed to remediation-engine."""
+        if self.mock_mode:
+            req_data = payload.get("request", {})
+            fmt = req_data.get("format", "markdown")
+            return {
+                "run_id": payload.get("request", {}).get("run_id", "run-mock"),
+                "report_id": "rep-mock-001",
+                "format": fmt,
+                "artifact_sha256": "mock-custom-report-sha256",
+                "filename": f"report-mock.{fmt}",
+                "content_type": "text/plain",
+                "download_url": f"/runs/{payload.get('request', {}).get('run_id', 'run-mock')}/reports/export/{fmt}",
+                "generated_at": "2026-11-24 14:00:00 UTC",
+                "summary_metrics": {"total": 1, "critical": 0, "high": 1, "blocked": 1, "verified_fixes": 1},
+                "gate_passed": True,
+                "content_text": "# Mock Report\nReport generation in mock mode."
+            }
+        return self._post(f"{self.remediation_url}/report/generate", payload, REPORT_TIMEOUT_S)
+
 service_clients = ServiceClients()

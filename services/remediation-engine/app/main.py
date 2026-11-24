@@ -13,8 +13,10 @@ from guardian_contracts.api_schemas import (
     VerifyResponse,
     ReportRequest,
     ReportResponse,
+    GenerateReportRequest,
+    GenerateReportResponse,
 )
-from guardian_contracts.state import Finding, Remediation
+from guardian_contracts.state import Finding, Remediation, Approval
 from .agents.prioritizer import PrioritizerAgent
 from .agents.policy import PolicyAgent
 from .agents.remediator import RemediatorAgent
@@ -149,4 +151,27 @@ def report(req: ReportRequest):
         remediations=req.remediations,
         approvals=req.approvals,
         audit_chain_head=req.audit_chain_head
+    )
+
+class EngineGenerateReportRequest(BaseModel):
+    request: GenerateReportRequest
+    findings: List[Finding] = []
+    policy_verdicts: Dict[str, str] = {}
+    remediations: List[Remediation] = []
+    approvals: List[Approval] = []
+    audit_chain_head: str = ""
+    repo_url: str = ""
+    commit_sha: str = "HEAD"
+
+@app.post("/report/generate", response_model=GenerateReportResponse)
+def report_generate(req: EngineGenerateReportRequest):
+    return reporter_agent.generate_custom_report(
+        req=req.request,
+        findings=req.findings,
+        policy_verdicts=req.policy_verdicts,
+        remediations=req.remediations,
+        approvals=req.approvals,
+        audit_chain_head=req.audit_chain_head,
+        repo_url=req.repo_url,
+        commit_sha=req.commit_sha,
     )

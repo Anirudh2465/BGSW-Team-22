@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{{ custom_title or "Supply Chain Guardian Security Report" }}</title>
+  <style>
+    @media print {
+      body { font-size: 11pt; color: #111; background: #fff; }
+      .page-break { page-break-before: always; }
+      .no-print { display: none !important; }
+      .container { max-width: 100% !important; padding: 0 !important; }
+    }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      line-height: 1.5;
+      color: #0f172a;
+      background: #f8fafc;
+      margin: 0;
+      padding: 0;
+    }
+    .container {
+      max-width: 1000px;
+      margin: 0 auto;
+      padding: 2.5rem;
+      background: #ffffff;
+      box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.05);
+    }
+    .header-banner {
+      border-bottom: 2px solid #0284c7;
+      padding-bottom: 1.25rem;
+      margin-bottom: 2rem;
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+    }
+    .title-area h1 {
+      margin: 0 0 0.5rem 0;
+      font-size: 1.75rem;
+      color: #0f172a;
+    }
+    .meta-tag {
+      font-size: 0.85rem;
+      color: #64748b;
+      margin: 0.2rem 0;
+    }
+    .kpi-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 1rem;
+      margin-bottom: 2rem;
+    }
+    .kpi-card {
+      border: 1px solid #e2e8f0;
+      border-radius: 8px;
+      padding: 1rem;
+      background: #f8fafc;
+      text-align: center;
+    }
+    .kpi-val {
+      font-size: 1.8rem;
+      font-weight: 700;
+      color: #0f172a;
+      margin-bottom: 0.25rem;
+    }
+    .kpi-label {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: #64748b;
+      font-weight: 600;
+    }
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 0.75rem;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+    .badge-critical { background: #fee2e2; color: #991b1b; }
+    .badge-high { background: #ffedd5; color: #9a3412; }
+    .badge-medium { background: #fef9c3; color: #854d0e; }
+    .badge-low { background: #f1f5f9; color: #475569; }
+    .badge-block { background: #dc2626; color: #ffffff; }
+    .badge-pass { background: #16a34a; color: #ffffff; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 1.5rem 0 2rem 0;
+      font-size: 0.875rem;
+    }
+    th, td {
+      border: 1px solid #e2e8f0;
+      padding: 10px 14px;
+      text-align: left;
+    }
+    th {
+      background: #f1f5f9;
+      font-weight: 600;
+      color: #334155;
+    }
+    tr:nth-child(even) {
+      background: #f8fafc;
+    }
+    .diff-box {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 0.8rem;
+      background: #0f172a;
+      color: #f8fafc;
+      padding: 1rem;
+      border-radius: 6px;
+      overflow-x: auto;
+      margin: 0.5rem 0 1.5rem 0;
+    }
+    .audit-box {
+      margin-top: 3rem;
+      padding: 1.25rem;
+      border-left: 4px solid #10b981;
+      background: #ecfdf5;
+      border-radius: 0 8px 8px 0;
+      font-family: ui-monospace, SFMono-Regular, monospace;
+      font-size: 0.82rem;
+      color: #065f46;
+    }
+    .audit-box strong { color: #047857; }
+    .print-btn {
+      background: #0284c7;
+      color: white;
+      border: none;
+      padding: 8px 16px;
+      border-radius: 6px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header-banner">
+      <div class="title-area">
+        <h1>{{ custom_title or "Supply Chain Guardian Security Report" }}</h1>
+        <div class="meta-tag"><strong>Target Repository:</strong> {{ repo_url }}</div>
+        <div class="meta-tag"><strong>Commit SHA:</strong> <code>{{ commit_sha }}</code></div>
+        <div class="meta-tag"><strong>Run ID:</strong> <code>{{ run_id }}</code> | <strong>Generated:</strong> {{ generated_at }}</div>
+        {% if notes %}<div class="meta-tag" style="margin-top: 0.5rem; color: #475569;"><em>Note: {{ notes }}</em></div>{% endif %}
+      </div>
+      <div class="no-print">
+        <button class="print-btn" onclick="window.print()">Print / Save as PDF</button>
+      </div>
+    </div>
+
+    <!-- Executive KPI Grid -->
+    <div class="kpi-grid">
+      <div class="kpi-card">
+        <div class="kpi-val">{{ counts.total }}</div>
+        <div class="kpi-label">Total Findings</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-val" style="color: #dc2626;">{{ counts.critical }}</div>
+        <div class="kpi-label">Critical Findings</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-val" style="color: #ea580c;">{{ counts.blocked }}</div>
+        <div class="kpi-label">Policy Blocks</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-val" style="color: #16a34a;">{{ counts.verified_fixes }}</div>
+        <div class="kpi-label">Verified Fixes</div>
+      </div>
+    </div>
+
+    <h2>1. Executive Summary & Policy Verdicts</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Finding ID</th>
+          <th>Package</th>
+          <th>Type</th>
+          <th>Risk Score</th>
+          <th>Policy Verdict</th>
+          <th>Automated Remediation</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for f in findings %}
+        <tr>
+          <td><code>{{ f.id }}</code></td>
+          <td><strong>{{ f.purl }}</strong></td>
+          <td>{{ f.kind }}</td>
+          <td>
+            <span class="badge {% if (f.score or 0) >= 80 %}badge-critical{% elif (f.score or 0) >= 60 %}badge-high{% elif (f.score or 0) >= 30 %}badge-medium{% else %}badge-low{% endif %}">
+              {{ f.score or 'N/A' }}
+            </span>
+          </td>
+          <td>
+            {% set v = policy_verdicts.get(f.id, 'PASS') %}
+            <span class="badge {% if v == 'BLOCK' %}badge-block{% else %}badge-pass{% endif %}">{{ v }}</span>
+          </td>
+          <td>
+            {% set r = remed_map.get(f.id) %}
+            {% if r and r.state == 'verified' %}
+              <span style="color: #16a34a; font-weight: 600;">✓ Verified ({{ r.candidates[r.chosen] if r.chosen is not none and r.candidates else 'Fix' }})</span>
+            {% elif r and r.state == 'draft' %}
+              <span style="color: #0284c7;">Draft Proposal</span>
+            {% elif r and r.state == 'escalated' %}
+              <span style="color: #d97706;">Escalated to Human</span>
+            {% else %}
+              <span style="color: #64748b;">No Auto-Fix</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+
+    <div class="page-break"></div>
+
+    <h2>2. Technical Vulnerability Root Cause & Evidence</h2>
+    {% for f in findings %}
+    <div style="margin-bottom: 2rem; border-bottom: 1px solid #e2e8f0; padding-bottom: 1.5rem;">
+      <h3 style="margin-bottom: 0.5rem; color: #1e293b;">
+        <code>{{ f.id }}</code>: {{ f.purl }}
+      </h3>
+      <p style="color: #334155; margin: 0.5rem 0;">{{ f.explanation or 'No detailed explanation attached.' }}</p>
+      
+      {% if f.path %}
+      <div style="font-size: 0.8rem; color: #64748b; margin: 0.5rem 0;">
+        <strong>Dependency Path:</strong> <code>{{ f.path | join(' -> ') }}</code>
+      </div>
+      {% endif %}
+
+      {% if f.evidence %}
+      <div style="margin-top: 0.75rem;">
+        <span style="font-size: 0.8rem; font-weight: 600; color: #475569;">Grounded Evidence Artifacts:</span>
+        <ul style="font-size: 0.8rem; color: #475569; margin: 0.25rem 0 0 1.25rem; padding: 0;">
+          {% for ev in f.evidence %}
+          <li><strong>{{ ev.tool }}</strong>: <code>{{ ev.id }}</code> (SHA-256: <code>{{ ev.artifact_sha256[:16] }}...</code>)</li>
+          {% endfor %}
+        </ul>
+      </div>
+      {% endif %}
+    </div>
+    {% endfor %}
+
+    <h2>3. Verified Remediations & Sandbox Verification</h2>
+    {% for r in remediations %}
+    <div style="margin-bottom: 1.5rem; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 1rem;">
+      <div style="display: flex; justify-content: space-between; align-items: center;">
+        <h4 style="margin: 0; color: #0f172a;">Finding <code>{{ r.finding_id[:10] }}</code></h4>
+        <span class="badge {% if r.state == 'verified' %}badge-pass{% else %}badge-high{% endif %}">{{ r.state }}</span>
+      </div>
+      <p style="font-size: 0.85rem; color: #475569; margin: 0.5rem 0;">
+        <strong>Target Version Upgrade:</strong> {{ r.candidates[r.chosen] if r.chosen is not none and r.candidates else 'None' }}
+      </p>
+      {% if r.patch_sha256 %}
+      <p style="font-size: 0.8rem; color: #64748b; margin: 0.25rem 0;">
+        <strong>Patch SHA-256:</strong> <code>{{ r.patch_sha256 }}</code>
+      </p>
+      {% endif %}
+    </div>
+    {% endfor %}
+
+    <div class="audit-box">
+      <strong>Ed25519 Cryptographic Audit Chain Provenance</strong><br>
+      <strong>Audit Head:</strong> {{ audit_chain_head }}<br>
+      <strong>Verification Command:</strong> <code>make verify-audit RUN_ID={{ run_id }}</code><br>
+      <span>This report was cryptographically sealed and generated from deterministic, immutable artifacts.</span>
+    </div>
+  </div>
+</body>
+</html>

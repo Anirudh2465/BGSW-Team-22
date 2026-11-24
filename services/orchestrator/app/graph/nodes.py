@@ -174,6 +174,13 @@ def resolve_node(state: GuardianState) -> Dict[str, Any]:
     _pull(run_id, "resolve", resp.artifact_sha256, GZIP_TAR)
     _pull(run_id, "resolve", resp.logs_artifact_sha256, "application/json")
 
+    stderr_snippet = (resp.details.get("stderr_tail") or "").strip()
+    reason = resp.details.get("error")
+    if not passed and not reason and stderr_snippet:
+        # Extract the last few meaningful error lines from Maven / npm / pip stderr
+        lines = [line.strip() for line in stderr_snippet.splitlines() if line.strip()]
+        reason = " | ".join(lines[-3:]) if lines else "Dependency resolution exited with error"
+
     gate = {
         "gate": "hook_observation_gate",
         "passed": passed,
@@ -181,7 +188,8 @@ def resolve_node(state: GuardianState) -> Dict[str, Any]:
         "anomalies": resp.details.get("hook_anomalies", False),
         "resolve_status": resp.details.get("resolve_status", {}),
         "egress": {k: resp.metrics.get(k) for k in ("proxy_requests", "proxy_blocked", "egress_domains_hit")},
-        "reason": resp.details.get("error"),
+        "reason": reason,
+        "stderr_tail": stderr_snippet if not passed else "",
     }
     artifacts = {k: v for k, v in {"tree": resp.artifact_sha256, "sinkhole_logs": resp.logs_artifact_sha256}.items() if v}
     return _record(state, "resolve_node", gate, {"stage": "resolve", "artifacts": artifacts})
