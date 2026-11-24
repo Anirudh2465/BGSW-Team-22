@@ -1,0 +1,23 @@
+{
+  "_comment": "Publishers known to sign their images with Sigstore keyless signing. For these, a missing or foreign signature is a finding (score 85). Check each identity against the publisher's documentation (source) before relying on it; images from publishers not listed here only get an informational 'unsigned' note.",
+  "policies": [
+    {
+      "prefix": "gcr.io/distroless/",
+      "subject": "keyless@distroless.iam.gserviceaccount.com",
+      "issuer": "https://accounts.google.com",
+      "source": "https://github.com/GoogleContainerTools/distroless#how-do-i-verify-distroless-images"
+    },
+    {
+      "prefix": "cgr.dev/chainguard/",
+      "subject_regex": "^https://github\\.com/chainguard-images/images(-private)?/\\.github/workflows/release\\.yaml@refs/heads/main$",
+      "issuer": "https://token.actions.githubusercontent.com",
+      "source": "https://edu.chainguard.dev/chainguard/chainguard-images/how-to-use/verifying-chainguard-images-and-metadata-signatures-with-cosign/"
+    },
+    {
+      "prefix": "registry.k8s.io/",
+      "subject": "krel-trust@k8s-releng-prod.iam.gserviceaccount.com",
+      "issuer": "https://accounts.google.com",
+      "source": "https://kubernetes.io/docs/tasks/administer-cluster/verify-signed-artifacts/"
+    }
+  ]
+}

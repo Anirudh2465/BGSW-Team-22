@@ -8,7 +8,8 @@
       "ecosystem": "maven",
       "expected_vulnerabilities": ["CVE-2021-44228"],
       "expected_policy_verdict": "BLOCK",
-      "expected_fix_version": "2.17.1"
+      "expected_fix_version": "2.25.4",
+      "fix_version_note": "2.17.1 fixes the four 2021 Log4Shell advisories; the remediator targets the lowest version that fixes every advisory known on log4j-core 2.14.1 (Grype data includes GHSA-3pxv-7cmr-fjr4, GHSA-h383-gmxw-35v2 and GHSA-6hg6-v5c8-fphq, fixed in 2.25.4)"
     },
     {
       "id": "node-express-app",
@@ -27,8 +28,9 @@
       "commit_sha": "feed01234567890abcdef1234567890abcdef12",
       "ecosystem": "pypi",
       "expected_vulnerabilities": ["CVE-2023-32681"],
-      "expected_policy_verdict": "BLOCK",
-      "expected_fix_version": "2.31.0"
+      "expected_policy_verdict": "PASS",
+      "expected_fix_version": "2.31.0",
+      "verdict_note": "Contextual risk score: CVSS 8.5, EPSS 0.70, not in KEV, reachability tier 2, direct runtime dependency -> (42.5 + 21) * 0.75 + 5 = 53 (Medium, PASS with warning). The old flat formula gave 64 (BLOCK)."
     },
     {
       "id": "clean-microservice",

@@ -34,12 +34,13 @@ class EgressProxy:
     """Forward proxy enforcing a strict allowlist of package registries and git hosts."""
 
     def __init__(self, port: int = 0, mode: str = "allowlist", sinkhole: Optional[SinkholeLogger] = None,
-                 bind_host: str = "0.0.0.0"):
+                 bind_host: str = "0.0.0.0", extra_domains=()):
         if mode not in ("allowlist", "sinkhole"):
             raise ValueError(f"Unknown proxy mode: {mode}")
         self.mode = mode
         self.port = port
         self.bind_host = bind_host
+        self.extra_domains = tuple(extra_domains)  # run-specific additions (e.g. image registries)
         self.sinkhole = sinkhole or SinkholeLogger()
         self.access_logs: List[Dict[str, Any]] = []
         self._lock = threading.Lock()
@@ -50,7 +51,7 @@ class EgressProxy:
 
     # ---------------------------------------------------------------- policy
     def check_request(self, target_host: str, method: str = "GET", path: str = "/", port: int = 443) -> bool:
-        allowed = self.mode == "allowlist" and port in ALLOWED_PORTS and is_domain_allowed(target_host)
+        allowed = self.mode == "allowlist" and port in ALLOWED_PORTS and is_domain_allowed(target_host, self.extra_domains)
         record = {
             "target_host": target_host,
             "port": port,

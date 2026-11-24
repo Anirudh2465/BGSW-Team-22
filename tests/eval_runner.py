@@ -62,7 +62,7 @@ class EvalRunner:
         print(f"[{status_icon}] {target_name}: {message}")
 
     def evaluate_golden_repos(self):
-        print("\n--- Evaluating Golden Repositories (4 Targets) ---")
+        print("\n--- Evaluating Golden Repositories (5 Targets) ---")
 
         # 1. Log4Shell Golden App
         score = calculate_deterministic_risk_score(10.0, 0.97, 1, 1, tier1_no_path=False)
@@ -93,8 +93,11 @@ class EvalRunner:
         passed_node = score_node >= 60 and verdict_node == "BLOCK"
         self.log_result("Golden 2: Node.js Prototype Pollution", passed_node, f"Score={score_node}, Policy Verdict={verdict_node}")
 
-        # 3. Python Flask App (CVSS=8.5, EPSS=0.70 -> Score 64, BLOCK in prod)
-        score_py = calculate_deterministic_risk_score(8.5, 0.70, 0, 2, tier1_no_path=False)
+        # 3. Python Flask App: CVSS 8.5, EPSS 0.70, not in KEV, reachability tier 2 (referenced, unknown), a direct
+        #    runtime dependency. Contextual score: (42.5 + 21) * 0.75 + 5 = 52.6 -> 53, Medium: PASS with warning.
+        #    (The old flat formula gave 64 / BLOCK; unproven reachability without KEV no longer blocks alone.)
+        score_py = calculate_deterministic_risk_score(8.5, 0.70, 0, 2, tier1_no_path=False, scope="runtime",
+                                                      direct=True, blast_radius=0)
         finding_py = Finding(
             id="f-py",
             kind="cve",
@@ -104,8 +107,18 @@ class EvalRunner:
             score=score_py
         )
         verdict_py = pol.evaluate_policy("r3", [finding_py], environment="prod").policy_verdicts["f-py"]
-        passed_py = score_py >= 60 and verdict_py == "BLOCK"
+        passed_py = score_py == 53 and verdict_py == "PASS"
         self.log_result("Golden 3: Python Requests App", passed_py, f"Score={score_py}, Policy Verdict={verdict_py}")
+
+        # 3b. Log4Shell pulled in only by test code: maximum threat, but non-production code never blocks
+        score_dev = calculate_deterministic_risk_score(10.0, 0.97, 1, 1, tier1_no_path=False, scope="test",
+                                                       direct=True, blast_radius=9)
+        finding_dev = Finding(id="f-dev", kind="cve", purl="pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1",
+                              evidence=[Evidence(id="e5", tool="grype", artifact_sha256="sha")], status="confirmed",
+                              score=score_dev)
+        verdict_dev = pol.evaluate_policy("r5", [finding_dev], environment="prod").policy_verdicts["f-dev"]
+        self.log_result("Golden 5: Test-scoped Log4Shell (hard cap)", score_dev <= 59 and verdict_dev == "PASS",
+                        f"Score={score_dev}, Policy Verdict={verdict_dev}")
 
         # 4. Clean Microservice Baseline
         finding_clean = []

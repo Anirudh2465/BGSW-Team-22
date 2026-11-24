@@ -1,22 +1,21 @@
 "use client";
 
 import React from "react";
+import { Link2 } from "lucide-react";
+import { CopyButton } from "./ui";
 
-interface AuditChainBadgeProps {
-  chainHead: string;
-}
-
-export function AuditChainBadge({ chainHead }: AuditChainBadgeProps) {
+/** Head of the Ed25519 hash-chained audit log. */
+export function AuditChainBadge({ chainHead }: { chainHead: string }) {
+  const genesis = !chainHead || /^0+$/.test(chainHead);
   return (
-    <div className="inline-flex items-center gap-2 bg-slate-900 border border-slate-800 rounded-full px-3.5 py-1.5 shadow-sm">
-      <span className="w-2 h-2 rounded-full bg-emerald-400"></span>
-      <span className="text-xs text-slate-400">Ed25519 Audit Head:</span>
-      <span className="text-xs font-mono text-emerald-400 font-semibold select-all">
-        {chainHead ? `${chainHead.slice(0, 16)}...` : "Genesis"}
-      </span>
-      <span className="text-[10px] uppercase font-bold bg-emerald-950 text-emerald-400 px-1.5 py-0.5 rounded border border-emerald-800">
-        Verified
-      </span>
+    <div
+      className="inline-flex items-center gap-2 rounded-lg bg-white/[0.03] py-1 pl-2.5 pr-1 text-xs ring-1 ring-inset ring-white/10"
+      title={chainHead || "Genesis"}
+    >
+      <Link2 className="h-3.5 w-3.5 text-emerald-400" />
+      <span className="text-ink-muted">Audit chain</span>
+      <span className="font-mono text-emerald-300">{genesis ? "genesis" : `${chainHead.slice(0, 12)}…`}</span>
+      {!genesis && <CopyButton text={chainHead} />}
     </div>
   );
 }

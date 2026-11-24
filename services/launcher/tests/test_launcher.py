@@ -256,6 +256,7 @@ def test_stage3_scan_runs_offline_and_bundles(store):
     runner = FakeRunner({"scan": {
         "sbom/syft.cdx.json": b'{"components": []}',
         "status/syft": b"ok", "status/trivy": b"ok", "status/cdxgen": b"missing", "status/trufflehog": b"ok",
+        "status/javaparser": b"ok", "codegraph/java.json": b'{"tool": "javaparser", "compilation_units": []}',
         "secrets.jsonl": secret_line + b"\n",
     }})
     res = run_stage3_scan("r1", source_sha, {"network_mode": "none", "tree_artifact_sha256": tree_sha},
@@ -263,7 +264,12 @@ def test_stage3_scan_runs_offline_and_bundles(store):
     assert res["status"] == "success"
     assert runner.calls[0]["egress"] is None
     bundle = read_members(store.get(res["raw_scan_artifact_sha256"]))
-    assert {"resolved/maven/root.json", "sbom/syft.cdx.json", "manifest.json"} <= set(bundle)
+    assert {"resolved/maven/root.json", "sbom/syft.cdx.json", "codegraph/java.json", "manifest.json"} <= set(bundle)
+    manifest = json.loads(bundle["manifest.json"])
+    assert manifest["tool_status"]["javaparser"] == "ok" and manifest["codegraph"] == ["codegraph/java.json"]
+    # The class-graph extractor runs inside the same offline sandbox script as the scanners.
+    from app.stages.stage3_scan import SCAN_SCRIPT
+    assert "javaparser" in SCAN_SCRIPT and runner.calls[0]["stage"] == "scan" and runner.calls[0]["egress"] is None
     assert b"AKIAREALSECRET" not in bundle["secrets.jsonl"]
     assert json.loads(bundle["manifest.json"])["tool_status"]["cdxgen"] == "missing"
     sent = read_members(runner.calls[0]["input_tar"])
@@ -274,19 +280,4 @@ def test_redact_trufflehog_drops_raw_values():
     out = redact_trufflehog(b'{"Raw":"x","RawV2":"y","Redacted":"z"}\nnot-json\n')
     assert json.loads(out) == {"Redacted": "z"}
 
-
-# ------------------------------------------------------------------ stage 4
-def test_stage_api_verify():
-    client = TestClient(launcher_main.app)
-    req = {
-        "run_id": "test-run-1",
-        "stage": "verify",
-        "source_artifact_sha256": "abcdef123456",
-        "parameters": {"patch_content": "--- a/pom.xml\n+++ b/pom.xml\n-2.14.1\n+2.17.1"},
-    }
-    res = client.post("/stages/run", json=req)
-    assert res.status_code == 200
-    data = res.json()
-    assert data["status"] == "success"
-    assert data["details"]["build_success"] is True
-    assert data["details"]["test_success"] is True
+# Stage 4 (verify) has its own suite: tests/test_stage4_verify.py

@@ -40,6 +40,12 @@ services:
       - SANDBOX_IMAGE_DIGEST_RESOLVE=${SANDBOX_IMAGE_DIGEST_RESOLVE:-}
       - SANDBOX_IMAGE_DIGEST_SCAN=${SANDBOX_IMAGE_DIGEST_SCAN:-}
       - SANDBOX_IMAGE_DIGEST_VERIFY=${SANDBOX_IMAGE_DIGEST_VERIFY:-}
+      # Live app previews: the launcher forwards these to the app inside its sandbox network (localhost only).
+      - PREVIEW_PORTS=18080,18081
+      - PREVIEW_TTL_S=${PREVIEW_TTL_S:-1800}
+    ports:
+      - "127.0.0.1:18080:18080"
+      - "127.0.0.1:18081:18081"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - launcher_artifacts:/var/lib/guardian/artifacts
@@ -73,6 +79,11 @@ services:
       - ARTIFACT_BACKEND=postgres
       - INTERNAL_API_TOKEN=${INTERNAL_API_TOKEN:-}
       - CORS_ORIGINS=http://localhost:3000
+      # Optional graph export: set NEO4J_URI=bolt://neo4j:7687 in .env and start with --profile neo4j
+      - NEO4J_URI=${NEO4J_URI:-}
+      - NEO4J_USER=neo4j
+      - NEO4J_PASSWORD=${NEO4J_PASSWORD:-guardian_dev_neo4j}
+      - NEO4J_BROWSER_URL=http://localhost:7474
     networks:
       - core
       - launcher
@@ -113,10 +124,17 @@ services:
     restart: unless-stopped
     environment:
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
-      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.5-flash}
+      # Push approved fixes to your fork: fine-grained PAT (Contents: read and write on the fork only)
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      - GITHUB_PUSH_MODE=${GITHUB_PUSH_MODE:-direct}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-3.8-flash}
+      - GEMINI_FALLBACK_MODEL=${GEMINI_FALLBACK_MODEL:-gemini-3.5-flash}
       - GITHUB_WRITER_APP_ID=${GITHUB_WRITER_APP_ID:-}
       - GITHUB_WRITER_PRIVATE_KEY_PATH=${GITHUB_WRITER_PRIVATE_KEY_PATH:-/secrets/writer.pem}
       - LAUNCHER_URL=http://launcher:8001
+      # The prioritizer reads the vulnerability enrichment artifact by hash (read-only).
+      - ORCHESTRATOR_URL=http://orchestrator:8000
+      - INTERNAL_API_TOKEN=${INTERNAL_API_TOKEN:-}
     volumes:
       - ./secrets:/secrets:ro
     networks:
@@ -131,8 +149,11 @@ services:
 
   web:
     build:
-      context: services/web
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: services/web/Dockerfile
+      args:
+        NEXT_PUBLIC_ORCHESTRATOR_URL: http://localhost:8000
+        NEXT_PUBLIC_ORCHESTRATOR_WS_URL: ws://localhost:8000
     container_name: guardian-web
     restart: unless-stopped
     depends_on:
@@ -144,6 +165,29 @@ services:
       - core
     ports:
       - "3000:3000"
+
+  neo4j:
+    image: neo4j:5.26-community
+    container_name: guardian-neo4j
+    restart: unless-stopped
+    profiles:
+      - neo4j
+    environment:
+      - NEO4J_AUTH=neo4j/${NEO4J_PASSWORD:-guardian_dev_neo4j}
+      - NEO4J_server_memory_heap_max__size=512m
+      - NEO4J_server_memory_pagecache_size=256m
+    volumes:
+      - neo4j_data:/data
+    networks:
+      - core
+    ports:
+      - "127.0.0.1:7474:7474"   # Neo4j Browser
+      - "127.0.0.1:7687:7687"   # Bolt
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
   ollama:
     image: ollama/ollama:latest
@@ -171,3 +215,4 @@ volumes:
   postgres_data:
   ollama_data:
   launcher_artifacts:
+  neo4j_data:

@@ -1,3 +1,4 @@
+from enum import Enum
 from typing import List, Dict, Optional, Any, Literal
 from pydantic import BaseModel, Field
 from .state import Finding, Remediation, Approval
@@ -124,6 +125,49 @@ class ReportResponse(BaseModel):
     vex_report_sha256: str
     pr_url: Optional[str] = None
     gate_passed: bool
+
+# On-Demand Report Generation Schemas
+class ReportFormat(str, Enum):
+    PDF = "pdf"
+    HTML = "html"
+    MARKDOWN = "markdown"
+    SARIF = "sarif"
+    OPENVEX = "vex"
+    CSV = "csv"
+
+class ReportScope(str, Enum):
+    FULL = "full"
+    CRITICAL_HIGH_ONLY = "critical_high_only"
+    VERIFIED_FIXES_ONLY = "verified_fixes_only"
+
+class ReportFilterConfig(BaseModel):
+    scope: ReportScope = Field(default=ReportScope.FULL)
+    min_score: int = Field(default=0, ge=0, le=100)
+    risk_bands: List[str] = Field(default_factory=lambda: ["Critical", "High", "Medium", "Low"])
+    include_remediations_only: bool = False
+    include_raw_evidence: bool = True
+    include_audit_trail: bool = True
+    environment: str = Field(default="prod")
+
+class GenerateReportRequest(BaseModel):
+    run_id: str
+    format: ReportFormat
+    config: ReportFilterConfig = Field(default_factory=ReportFilterConfig)
+    custom_title: Optional[str] = None
+    notes: Optional[str] = None
+
+class GenerateReportResponse(BaseModel):
+    run_id: str
+    report_id: str
+    format: ReportFormat
+    artifact_sha256: str
+    filename: str
+    content_type: str
+    download_url: str
+    generated_at: str
+    summary_metrics: Dict[str, Any]
+    gate_passed: bool
+    content_text: Optional[str] = None
 
 # Orchestrator Schemas
 class RunCreateRequest(BaseModel):

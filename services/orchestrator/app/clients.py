@@ -1,7 +1,7 @@
 import hashlib
 import os
 import httpx
-from typing import Dict, Any, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from guardian_contracts.api_schemas import (
     StageRunRequest,
     StageRunResponse,
@@ -25,8 +25,23 @@ from guardian_contracts.api_schemas import (
 from guardian_contracts.state import Finding, Evidence, Remediation
 from .config import config
 
+# Detection runs the SBOM vulnerability assessment (Grype + OSV-Scanner + feeds): give it real time.
+# > 2 x VULN_TOOL_TIMEOUT_S (600 s, tools run one after the other) + feed and artifact I/O.
+DETECT_TIMEOUT_S = float(os.getenv("DETECT_TIMEOUT_S", "1500"))
+PRIORITIZE_TIMEOUT_S = float(os.getenv("PRIORITIZE_TIMEOUT_S", "180"))
+POLICY_TIMEOUT_S = float(os.getenv("POLICY_TIMEOUT_S", "60"))
+REMEDIATE_TIMEOUT_S = float(os.getenv("REMEDIATE_TIMEOUT_S", "300"))
+REPORT_TIMEOUT_S = float(os.getenv("REPORT_TIMEOUT_S", "120"))
+PR_TIMEOUT_S = float(os.getenv("PR_TIMEOUT_S", "180"))
+
 class ServiceError(RuntimeError):
     """A downstream service failed; the calling node records a failed gate."""
+
+
+def _escalate(rem: Remediation, reason: str) -> Remediation:
+    v = dict(rem.validation or {})
+    v["verification"] = {**(v.get("verification") or {}), "outcome": "escalated", "possible": False, "reason": reason}
+    return rem.model_copy(update={"state": "escalated", "validation": v})
 
 
 MOCK_SHA = {stage: hashlib.sha256(f"mock-{stage}".encode()).hexdigest()
@@ -92,6 +107,30 @@ class ServiceClients:
             )
         timeout = config.STAGE_TIMEOUTS.get(req.stage, 600)
         return StageRunResponse(**self._post(f"{self.launcher_url}/stages/run", req.model_dump(), timeout))
+
+    # ---------------------------------------------------- live app previews
+    def _launcher(self, method: str, path: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        try:
+            with httpx.Client(timeout=60) as client:
+                res = client.request(method, f"{self.launcher_url}{path}", json=payload, headers=self._headers())
+        except httpx.HTTPError as exc:
+            raise ServiceError(f"launcher unreachable: {exc}") from exc
+        if res.status_code != 200:
+            try:
+                detail = res.json().get("detail")
+            except ValueError:
+                detail = res.text[:200]
+            raise ServiceError(f"launcher: {detail}")
+        return res.json()
+
+    def start_preview(self, source_sha256: str, label: str) -> Dict[str, Any]:
+        return self._launcher("POST", "/previews", {"source_artifact_sha256": source_sha256, "label": label})
+
+    def get_preview(self, preview_id: str) -> Dict[str, Any]:
+        return self._launcher("GET", f"/previews/{preview_id}")
+
+    def stop_preview(self, preview_id: str) -> Dict[str, Any]:
+        return self._launcher("DELETE", f"/previews/{preview_id}")
 
     def fetch_launcher_artifact(self, sha256: str) -> bytes:
         try:
@@ -163,16 +202,19 @@ class ServiceClients:
                 gate_passed=True,
                 cross_check_summary={"total_findings": 1}
             )
+        # The SBOM assessment runs Grype + OSV-Scanner and fetches EPSS/KEV, so it takes seconds to
+        # minutes. A failure must never look like "no vulnerabilities": fail the gate, keep the error.
         try:
-            with httpx.Client(timeout=1.0) as client:
+            with httpx.Client(timeout=DETECT_TIMEOUT_S) as client:
                 res = client.post(f"{self.scanner_url}/detect", json=req.model_dump())
+                res.raise_for_status()
                 return DetectResponse(**res.json())
-        except Exception:
+        except Exception as exc:
             return DetectResponse(
                 run_id=req.run_id,
                 findings=[],
-                gate_passed=True,
-                cross_check_summary={"total_findings": 0}
+                gate_passed=False,
+                cross_check_summary={"total_findings": 0, "error": f"detect call failed: {type(exc).__name__}: {exc}"[:300]}
             )
 
     def call_prioritize(self, req: PrioritizeRequest) -> PrioritizeResponse:
@@ -183,14 +225,16 @@ class ServiceClients:
                 gate_passed=True
             )
         try:
-            with httpx.Client(timeout=1.0) as client:
+            with httpx.Client(timeout=PRIORITIZE_TIMEOUT_S) as client:
                 res = client.post(f"{self.remediation_url}/prioritize", json=req.model_dump())
+                res.raise_for_status()
                 return PrioritizeResponse(**res.json())
         except Exception:
+            # Unscored findings must not pass the Grounding gate.
             return PrioritizeResponse(
                 run_id=req.run_id,
                 prioritized_findings=req.findings,
-                gate_passed=True
+                gate_passed=False
             )
 
     def call_policy(self, req: PolicyRequest) -> PolicyResponse:
@@ -202,9 +246,7 @@ class ServiceClients:
                 rule_evaluations=[]
             )
         try:
-            with httpx.Client(timeout=1.0) as client:
-                res = client.post(f"{self.remediation_url}/policy", json=req.model_dump())
-                return PolicyResponse(**res.json())
+            return PolicyResponse(**self._post(f"{self.remediation_url}/policy", req.model_dump(), POLICY_TIMEOUT_S))
         except Exception:
             return PolicyResponse(
                 run_id=req.run_id,
@@ -220,51 +262,70 @@ class ServiceClients:
                     finding_id=f.id,
                     candidates=["pkg:maven/org.apache.logging.log4j/log4j-core@2.17.1"],
                     chosen=0,
-                    patch_sha256="mock-patch-sha256",
-                    state="draft"
+                    patch_sha256=MOCK_SHA["verify"],
+                    state="draft",
+                    validation={"remediation": {"reason": None, "mock": True}},
                 )
                 for f in req.findings_to_fix
             ]
-            return RemediateResponse(
-                run_id=req.run_id,
-                remediations=rems,
-                gate_passed=True
-            )
+            return RemediateResponse(run_id=req.run_id, remediations=rems, gate_passed=True)
         try:
-            with httpx.Client(timeout=1.0) as client:
-                res = client.post(f"{self.remediation_url}/remediate", json=req.model_dump())
-                return RemediateResponse(**res.json())
-        except Exception:
-            return RemediateResponse(
-                run_id=req.run_id,
-                remediations=[],
-                gate_passed=True
-            )
+            data = self._post(f"{self.remediation_url}/remediate", req.model_dump(), REMEDIATE_TIMEOUT_S)
+            return RemediateResponse(**data)
+        except Exception as exc:
+            # No remediation without the remediator: the findings stay unremediated and the gate fails.
+            return RemediateResponse(run_id=req.run_id, remediations=[
+                Remediation(finding_id=f.id, state="escalated",
+                            validation={"remediation": {"reason": f"remediator unavailable: {exc}"[:300]}})
+                for f in req.findings_to_fix], gate_passed=False)
+
+    def call_remediate_next(self, run_id: str, source_sha256: str,
+                            remediations: List[Remediation]) -> Tuple[List[Remediation], bool]:
+        """Service-local remediation-engine endpoint: a new draft for the next code-built candidate."""
+        if not remediations:
+            return [], True
+        if self.mock_mode:
+            return [_escalate(r, "MOCK_SERVICES: no next candidate in mock mode") for r in remediations], True
+        try:
+            data = self._post(f"{self.remediation_url}/remediate/next", {
+                "run_id": run_id, "source_artifact_sha256": source_sha256,
+                "remediations": [r.model_dump() for r in remediations]}, REMEDIATE_TIMEOUT_S)
+            return [Remediation(**r) for r in data["remediations"]], bool(data.get("gate_passed"))
+        except Exception as exc:
+            return [_escalate(r, f"next candidate could not be written: {exc}"[:300]) for r in remediations], False
+
+    def call_rescan(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Service-local scanner-intel endpoint: rebuild the patched SBOM, diff it, re-assess it."""
+        if self.mock_mode:
+            raise ServiceError("MOCK_SERVICES: no rescan in mock mode")
+        return self._post(f"{self.scanner_url}/rescan", payload, config.RESCAN_TIMEOUT_S)
+
+    def call_assist(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Service-local remediation-engine endpoint: 'Ask Gemini' for one finding."""
+        if self.mock_mode:
+            raise ServiceError("MOCK_SERVICES: no assist in mock mode")
+        return self._post(f"{self.remediation_url}/remediate/assist", payload, REMEDIATE_TIMEOUT_S)
+
+    def call_pull_request(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Service-local remediation-engine endpoint: open the PR for one approved patch (writer App)."""
+        if self.mock_mode:
+            return {"status": "not_configured", "pr_url": None, "reason": "MOCK_SERVICES"}
+        return self._post(f"{self.remediation_url}/pull-request", payload, PR_TIMEOUT_S)
 
     def call_verify(self, req: VerifyRequest) -> VerifyResponse:
+        """The Verification gate runs in remediation-engine (code). If it cannot be reached, nothing is
+        verified: every draft is escalated with the reason."""
         if self.mock_mode:
-            verified = [
-                r.model_copy(update={
-                    "validation": {"build_passed": True, "tests_passed": True, "rescan_passed": True},
-                    "state": "verified"
-                })
-                for r in req.remediations
-            ]
-            return VerifyResponse(
-                run_id=req.run_id,
-                verified_remediations=verified,
-                gate_passed=True
-            )
+            return VerifyResponse(run_id=req.run_id, gate_passed=True, verified_remediations=[
+                _escalate(r, "MOCK_SERVICES: verification not possible") if r.state == "draft" else r
+                for r in req.remediations])
         try:
-            with httpx.Client(timeout=1.0) as client:
-                res = client.post(f"{self.remediation_url}/verify", json=req.model_dump())
-                return VerifyResponse(**res.json())
-        except Exception:
-            return VerifyResponse(
-                run_id=req.run_id,
-                verified_remediations=req.remediations,
-                gate_passed=True
-            )
+            data = self._post(f"{self.remediation_url}/verify", req.model_dump(), config.VERIFY_TIMEOUT_S)
+            return VerifyResponse(**data)
+        except Exception as exc:
+            return VerifyResponse(run_id=req.run_id, gate_passed=False, verified_remediations=[
+                _escalate(r, f"verification gate unavailable: {exc}"[:300]) if r.state == "draft" else r
+                for r in req.remediations])
 
     def call_report(self, req: ReportRequest) -> ReportResponse:
         if self.mock_mode:
@@ -277,9 +338,7 @@ class ServiceClients:
                 gate_passed=True
             )
         try:
-            with httpx.Client(timeout=1.0) as client:
-                res = client.post(f"{self.remediation_url}/report", json=req.model_dump())
-                return ReportResponse(**res.json())
+            return ReportResponse(**self._post(f"{self.remediation_url}/report", req.model_dump(), REPORT_TIMEOUT_S))
         except Exception:
             return ReportResponse(
                 run_id=req.run_id,
@@ -289,5 +348,25 @@ class ServiceClients:
                 pr_url=None,
                 gate_passed=True
             )
+
+    def call_generate_report(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """On-demand report generation routed to remediation-engine."""
+        if self.mock_mode:
+            req_data = payload.get("request", {})
+            fmt = req_data.get("format", "markdown")
+            return {
+                "run_id": payload.get("request", {}).get("run_id", "run-mock"),
+                "report_id": "rep-mock-001",
+                "format": fmt,
+                "artifact_sha256": "mock-custom-report-sha256",
+                "filename": f"report-mock.{fmt}",
+                "content_type": "text/plain",
+                "download_url": f"/runs/{payload.get('request', {}).get('run_id', 'run-mock')}/reports/export/{fmt}",
+                "generated_at": "2026-11-24 14:00:00 UTC",
+                "summary_metrics": {"total": 1, "critical": 0, "high": 1, "blocked": 1, "verified_fixes": 1},
+                "gate_passed": True,
+                "content_text": "# Mock Report\nReport generation in mock mode."
+            }
+        return self._post(f"{self.remediation_url}/report/generate", payload, REPORT_TIMEOUT_S)
 
 service_clients = ServiceClients()

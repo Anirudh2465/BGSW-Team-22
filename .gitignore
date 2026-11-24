@@ -16,6 +16,8 @@ eggs/
 .eggs/
 lib/
 lib64/
+# ...but the web dashboard's source folder is code, not a Python build dir
+!services/web/src/lib/
 parts/
 sdist/
 var/
@@ -59,3 +61,5 @@ Thumbs.db
 
 # Docker
 *.tar.gz
+
+*.pdf

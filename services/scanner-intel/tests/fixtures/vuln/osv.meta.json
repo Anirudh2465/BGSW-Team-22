@@ -1,0 +1,12 @@
+{
+  "version": "2.7.0",
+  "db": {
+    "mode": "offline",
+    "ecosystems": [
+      "Maven",
+      "PyPI",
+      "npm"
+    ],
+    "downloaded": "2026-11-23"
+  }
+}

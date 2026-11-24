@@ -7,16 +7,17 @@ module.exports = {
   theme: {
     extend: {
       colors: {
-        guardian: {
-          bg: "#0b0f19",
-          card: "#131b2e",
-          border: "#1f293d",
-          accent: "#3b82f6",
-          danger: "#ef4444",
-          warning: "#f59e0b",
-          success: "#10b981",
-        }
-      }
+        canvas: "#09090b",
+        surface: "#111114",
+        raised: "#18181c",
+        line: "#24242a",
+        ink: { DEFAULT: "#ededf0", soft: "#c4c4cc", muted: "#8a8a96" },
+        accent: { DEFAULT: "#6366f1", soft: "#a5b4fc" },
+      },
+      fontFamily: {
+        sans: ["Inter", "ui-sans-serif", "system-ui", "-apple-system", "Segoe UI", "Roboto", "sans-serif"],
+        mono: ["JetBrains Mono", "ui-monospace", "SFMono-Regular", "Menlo", "Consolas", "monospace"],
+      },
     },
   },
   plugins: [],

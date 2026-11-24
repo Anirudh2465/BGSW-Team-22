@@ -19,3 +19,8 @@ dependencies = [
 dev = [
     "pytest>=7.4.0",
 ]
+
+[tool.pytest.ini_options]
+markers = [
+    "docker: needs a Docker daemon and the built sandbox images (opt-in: DOCKER_AVAILABLE=1)",
+]

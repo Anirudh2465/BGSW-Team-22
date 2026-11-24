@@ -1,0 +1,78 @@
+# Developer Security Remediation Action Plan
+
+**Repository**: `{{ repo_url }}`  
+**Commit SHA**: `{{ commit_sha }}`  
+**Run ID**: `{{ run_id }}`  
+**Generated At**: `{{ generated_at }}`  
+
+---
+
+## 1. Executive Remediation Summary
+
+- **Total Findings Evaluated**: {{ counts.total }}
+- **Critical Vulnerabilities**: {{ counts.critical }}
+- **Policy Blocker Findings (BLOCK)**: {{ counts.blocked }}
+- **Verified Automated Fixes Available**: {{ counts.verified_fixes }}
+
+---
+
+## 2. Immediate Required Actions (Policy Blockers)
+
+{% for r in remediations if r.state == 'verified' %}
+### Upgrade `{{ r.candidates[r.chosen] if r.chosen is not none and r.candidates else r.finding_id }}`
+- **Affects Finding**: `{{ r.finding_id }}`
+- **Target Upgrade**: `{{ r.candidates[r.chosen] if r.chosen is not none and r.candidates else 'Verified Fix' }}`
+- **Sandbox Verification**: ✅ PASSED (clean build, 0 test regressions)
+- **Patch Artifact**: `{{ r.patch_sha256 }}`
+
+#### How to Apply the Patch:
+```bash
+# Retrieve and apply verified patch from the Supply Chain Guardian CAS artifact store:
+curl -s http://localhost:8000/artifacts/{{ r.patch_sha256 }} | git apply -v
+```
+
+{% if r.diff %}
+#### Patch Diff Preview:
+```diff
+{{ r.diff }}
+```
+{% endif %}
+
+---
+{% else %}
+*No automated verified patches available. Inspect manual remediation guidance below.*
+{% endfor %}
+
+---
+
+## 3. Findings Breakdown & Remediation Guidance
+
+{% for f in findings %}
+### Finding `{{ f.id }}`: `{{ f.purl }}`
+- **Type**: `{{ f.kind }}`
+- **Risk Score**: **{{ f.score }} / 100**
+- **Policy Verdict**: `{{ policy_verdicts.get(f.id, 'PASS') }}`
+- **Root Cause & Technical Analysis**:  
+  {{ f.explanation or 'No explanation available.' }}
+
+{% if f.path %}
+- **Dependency Call Path**:
+  `{{ f.path | join(' -> ') }}`
+{% endif %}
+
+{% if f.evidence %}
+- **Evidence IDs**:
+  {% for ev in f.evidence %}
+  - `{{ ev.tool }}`: `{{ ev.id }}` (SHA: `{{ ev.artifact_sha256[:12] }}...`)
+  {% endfor %}
+{% endif %}
+
+---
+{% endfor %}
+
+## 4. Cryptographic Provenance
+- **Ed25519 Audit Chain Head**: `{{ audit_chain_head }}`
+- **Verify Audit Trail**:
+```bash
+make verify-audit RUN_ID={{ run_id }}
+```

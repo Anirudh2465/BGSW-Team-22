@@ -48,6 +48,24 @@ ALLOWLISTED_EGRESS_DOMAINS = [
 ]
 
 
-def is_domain_allowed(host: str) -> bool:
+# Container registries (and the hosts they serve image layers from) and Sigstore, allowed only for a
+# resolve run that scans base images. Some registries redirect layer downloads to other CDN hosts;
+# such a download is blocked and logged by the proxy, and the image is recorded as "fail".
+IMAGE_REGISTRY_DOMAINS = [
+    "docker.io", "registry-1.docker.io", "auth.docker.io", "production.cloudflare.docker.com",
+    "ghcr.io", "pkg-containers.githubusercontent.com",
+    "gcr.io", "pkg.dev", "registry.k8s.io",
+    "mcr.microsoft.com",
+    "quay.io",
+    "cgr.dev",
+]
+SIGSTORE_DOMAINS = ["rekor.sigstore.dev", "fulcio.sigstore.dev", "tuf-repo-cdn.sigstore.dev"]
+
+
+def _matches(host: str, domains) -> bool:
     host_clean = host.split(":")[0].lower().strip().rstrip(".")
-    return any(host_clean == d or host_clean.endswith("." + d) for d in ALLOWLISTED_EGRESS_DOMAINS)
+    return any(host_clean == d or host_clean.endswith("." + d) for d in domains)
+
+
+def is_domain_allowed(host: str, extra_domains=()) -> bool:
+    return _matches(host, ALLOWLISTED_EGRESS_DOMAINS) or (bool(extra_domains) and _matches(host, extra_domains))

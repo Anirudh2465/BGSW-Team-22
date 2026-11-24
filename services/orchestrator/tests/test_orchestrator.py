@@ -84,10 +84,12 @@ def test_pipeline_execution_and_approval():
     run_res = client.get(f"/runs/{run_id}")
     assert run_res.status_code == 200
     run_data = run_res.json()
-    assert run_data["status"] == "completed"
-    assert len(run_data["gate_results"]) == 9
-    assert gates(run_data)[:4] == ["clone_integrity_gate", "manifest_profile_gate", "hook_observation_gate",
-                                   "coverage_gate"]
+    # Nothing is verified automatically: the run pauses with the draft fix until a human acts.
+    assert run_data["status"] == "awaiting_approval"
+    assert gates(run_data) == ["clone_integrity_gate", "manifest_profile_gate", "hook_observation_gate",
+                               "coverage_gate", "cross_check_gate", "grounding_gate", "policy_consistency_gate",
+                               "fix_safety_gate"]
+    assert [d["finding_id"] for d in run_data["awaiting_verification"]] == list(run_data["remediations"])
     assert run_data["commit_sha"] == COMMIT  # HEAD pinned to the scanned commit
 
     graph = client.get(f"/runs/{run_id}/graph").json()
@@ -95,39 +97,30 @@ def test_pipeline_execution_and_approval():
     assert graph["coverage"] == {"maven": "scanned"}
 
     events = client.get(f"/runs/{run_id}/events").json()
-    assert events[-1]["payload"]["status"] == "completed"
+    assert events[-1]["payload"]["status"] == "awaiting_approval"
     assert any(e["event_type"] == "gate_result" and e["payload"]["gate_name"] == "coverage_gate" for e in events)
 
-    RUNS_DB[run_id]["remediations"]["f-1"] = Remediation(
-        finding_id="f-1",
-        candidates=["pkg:maven/org.apache.logging.log4j/log4j-core@2.17.1"],
-        chosen=0,
-        patch_sha256="abc123456789",
-        state="verified"
-    )
+    # Verify on request: mock services never produce a real stage-4 result, so it is escalated, never verified.
+    fid = next(iter(run_data["remediations"]))
+    assert client.post(f"/runs/{run_id}/remediations/{fid}/verify", json={}).status_code == 200
+    run_data = client.get(f"/runs/{run_id}").json()
+    rem = run_data["remediations"][fid]
+    assert rem["state"] == "escalated" and "verification not possible" in rem["validation"]["verification"]["reason"]
+    assert run_data["status"] == "completed"   # nothing left to verify or decide -> reporter ran
+    assert gates(run_data)[-3:] == ["verification_gate", "human_decision_gate", "completeness_gate"]
 
-    appr_res = client.post(f"/runs/{run_id}/approve", json={
-        "finding_id": "f-1",
-        "decision": "APPROVED",
-        "user_id": "secops-analyst-1",
-        "patch_sha256": "abc123456789"
-    })
-    assert appr_res.status_code == 200
-    assert appr_res.json()["status"] == "recorded"
+    # A completed run accepts no approvals, and an unverified remediation can never be approved.
+    RUNS_DB[run_id]["remediations"]["f-1"] = Remediation(
+        finding_id="f-1", candidates=["pkg:maven/org.apache.logging.log4j/log4j-core@2.17.1"], chosen=0,
+        patch_sha256="abc123456789", state="verified")
+    late = client.post(f"/runs/{run_id}/approve", json={
+        "finding_id": "f-1", "decision": "APPROVED", "user_id": "secops-analyst-1", "patch_sha256": "abc123456789"})
+    assert late.status_code == 409
 
     RUNS_DB[run_id]["remediations"]["f-unverified"] = Remediation(
-        finding_id="f-unverified",
-        candidates=["pkg:maven/test@1.1.0"],
-        chosen=0,
-        patch_sha256="999888",
-        state="draft"
-    )
+        finding_id="f-unverified", candidates=["pkg:maven/test@1.1.0"], chosen=0, patch_sha256="999888", state="draft")
     bad_res = client.post(f"/runs/{run_id}/approve", json={
-        "finding_id": "f-unverified",
-        "decision": "APPROVED",
-        "user_id": "secops-analyst-1",
-        "patch_sha256": "999888"
-    })
+        "finding_id": "f-unverified", "decision": "APPROVED", "user_id": "secops-analyst-1", "patch_sha256": "999888"})
     assert bad_res.status_code == 400
     assert "not been verified" in bad_res.json()["detail"]
 
@@ -167,6 +160,11 @@ class FakeServices:
             assert req.parameters["network_mode"] == "none"
             return StageRunResponse(run_id=req.run_id, stage="scan", status="success",
                                     artifact_sha256=self.blob("bundle"), details={"network_isolated": True})
+        if req.stage == "verify" and req.parameters.get("mode") == "health":
+            return StageRunResponse(run_id=req.run_id, stage="verify", status="success",
+                                    artifact_sha256=self.blob("health"),
+                                    details={"mode": "health", "build_success": True, "tests_found": False,
+                                             "startup_ok": None})
         raise AssertionError(req.stage)
 
     def fetch_launcher_artifact(self, digest):
@@ -198,17 +196,18 @@ def fake(monkeypatch):
                      "call_cartographer", "call_discover"):
             monkeypatch.setattr(service_clients, name, getattr(services, name))
         # Back half (detect onwards) is out of scope here: use its built-in mock responses.
-        for name in ("call_detect", "call_prioritize", "call_policy", "call_remediate", "call_verify", "call_report"):
+        for name in ("call_detect", "call_prioritize", "call_policy", "call_remediate", "call_remediate_next",
+                     "call_verify", "call_report"):
             monkeypatch.setattr(service_clients, name, _mocked(getattr(service_clients, name)))
         return services
     return install
 
 
 def _mocked(fn):
-    def inner(req):
+    def inner(*args):
         service_clients.mock_mode = True
         try:
-            return fn(req)
+            return fn(*args)
         finally:
             service_clients.mock_mode = False
     return inner
@@ -222,10 +221,12 @@ def _start():
 def test_front_half_brokers_artifacts_and_feeds_bundle_to_discover(fake):
     services = fake()
     run_id, data = _start()
-    assert data["status"] == "completed"
+    assert data["status"] == "awaiting_approval"  # paused with the draft fix: verification is on request
 
     stages = [c[1] for c in services.calls if c[0] == "stage"]
-    assert stages == ["clone", "resolve", "scan"]
+    assert stages == ["clone", "resolve", "scan", "verify"]   # verify = the repo health check (mode "health")
+    health = next(c[2] for c in services.calls if c[0] == "stage" and c[1] == "verify")
+    assert health == {"mode": "health"}
     resolve_params = next(c[2] for c in services.calls if c[0] == "stage" and c[1] == "resolve")
     assert resolve_params["observe_hooks"] is True  # from the check plan
 
@@ -286,7 +287,9 @@ def test_coverage_gate_retries_resolve_once_then_continues(fake):
     assert [g["attempt"] for g in coverage_gates] == [1, 2]
     assert coverage_gates[0]["action"] == "retry_resolve"
     assert coverage_gates[1]["action"] == "marked_skipped"
-    assert [c[1] for c in services.calls if c[0] == "stage"] == ["clone", "resolve", "scan", "resolve", "scan"]
+    # one health check, after the coverage retry settled (verify = stage 4 in "health" mode)
+    assert [c[1] for c in services.calls if c[0] == "stage"] == ["clone", "resolve", "scan", "resolve", "scan",
+                                                                 "verify"]
     assert "cross_check_gate" in gates(data)  # pipeline continued with npm marked skipped
     assert data["coverage"]["npm"] == "skipped"
 
@@ -295,7 +298,7 @@ def test_coverage_retry_succeeds(fake):
     fake(coverage_results=(False, True))
     run_id, data = _start()
     assert [g["passed"] for g in data["gate_results"] if g["gate"] == "coverage_gate"] == [False, True]
-    assert data["status"] == "completed"
+    assert data["status"] == "awaiting_approval"
 
 
 def test_service_error_becomes_failed_gate(fake, monkeypatch):
@@ -311,3 +314,126 @@ def test_service_error_becomes_failed_gate(fake, monkeypatch):
     gate = data["gate_results"][-1]
     assert gate["gate"] == "manifest_profile_gate" and gate["passed"] is False
     assert "unreachable" in gate["error"]
+
+
+# ------------------------------------------------------------------------------
+# Neo4j export (optional visualisation)
+# ------------------------------------------------------------------------------
+from app.db import neo4j_store
+from app.db.neo4j_store import Neo4jExporter, build_rows
+
+SAMPLE_GRAPH = {
+    "nodes": [
+        {"id": "app", "kind": "application"},
+        {"id": "pkg:maven/com.example/app@1.0.0", "kind": "module", "name": "app", "version": "1.0.0",
+         "ecosystem": "maven", "sources": ["resolved:maven"], "depth": 1},
+        {"id": "pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1", "kind": "library", "name": "log4j-core",
+         "version": "2.14.1", "ecosystem": "maven", "sources": ["resolved:maven", "syft"], "depth": 2, "direct": True,
+         "resolved": True},
+        {"id": "pkg:golang/github.com/gin-gonic/gin@v1.9.1", "kind": "library", "name": "gin", "version": "v1.9.1",
+         "ecosystem": "golang", "sources": ["syft"], "single_source": True, "depth": 1},
+    ],
+    "links": [
+        {"source": "app", "target": "pkg:maven/com.example/app@1.0.0", "relationship": "module"},
+        {"source": "pkg:maven/com.example/app@1.0.0", "target": "pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1",
+         "relationship": "depends_on", "scope": "compile"},
+        {"source": "app", "target": "pkg:golang/github.com/gin-gonic/gin@v1.9.1", "relationship": "unresolved"},
+    ],
+}
+
+
+def test_neo4j_rows_from_dep_graph():
+    rows = build_rows(SAMPLE_GRAPH)
+    assert [c["purl"] for c in rows["components"] if c["module"]] == ["pkg:maven/com.example/app@1.0.0"]
+    assert rows["modules"] == [{"purl": "pkg:maven/com.example/app@1.0.0"}]
+    assert rows["depends"] == [{"source": "pkg:maven/com.example/app@1.0.0",
+                                "target": "pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1", "scope": "compile"}]
+    assert rows["observed"] == [{"purl": "pkg:golang/github.com/gin-gonic/gin@v1.9.1"}]
+    gin = next(i for i in rows["includes"] if "gin" in i["purl"])
+    assert gin["single_source"] is True and gin["resolved"] is False
+    assert all(c["purl"] != "app" for c in rows["components"])
+
+
+def test_neo4j_export_disabled_without_uri():
+    assert Neo4jExporter("", "neo4j", "x").export_run("r", "u", "c", "s", SAMPLE_GRAPH)["exported"] is False
+
+
+def test_neo4j_export_writes_run_scoped_graph():
+    queries = []
+
+    class Tx:
+        def run(self, cypher, **params):
+            queries.append((cypher, params))
+
+    class Session:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def run(self, cypher, **params): queries.append((cypher, params))
+        def execute_write(self, fn, *args): return fn(Tx(), *args)
+
+    class Driver:
+        def session(self): return Session()
+
+    exporter = Neo4jExporter("bolt://neo4j:7687", "neo4j", "pw")
+    exporter._driver = Driver()
+    result = exporter.export_run("run-1", "https://github.com/x/y", "abc", "sha", SAMPLE_GRAPH)
+    assert result == {"exported": True, "components": 3, "edges": 1}
+    cyphers = " ".join(q for q, _ in queries)
+    assert "DETACH DELETE r" in cyphers and "DEPENDS_ON {run_id: $run_id" in cyphers and "OBSERVED" in cyphers
+    assert all(p.get("run_id") == "run-1" for q, p in queries if "run_id" in p)
+
+
+def test_neo4j_export_failure_never_fails_scan():
+    class Broken:
+        def session(self): raise ConnectionError("neo4j down")
+
+    exporter = Neo4jExporter("bolt://neo4j:7687", "neo4j", "pw")
+    exporter._driver = Broken()
+    res = exporter.export_run("run-1", "u", "c", "s", SAMPLE_GRAPH)
+    assert res["exported"] is False and "neo4j down" in res["reason"]
+
+
+def test_neo4j_endpoint_gives_browser_links():
+    run_id = client.post("/runs", json={"repo_url": "https://github.com/example/log4shell"}).json()["run_id"]
+    data = client.get(f"/runs/{run_id}/neo4j").json()
+    assert data["enabled"] is False and data["export"]["exported"] is False
+    assert data["queries"][0]["url"].startswith("http://localhost:7474/browser/?cmd=edit&arg=")
+    assert run_id in data["queries"][0]["cypher"]
+
+
+def test_graph_artifacts_are_separate_audited_and_downloadable(fake, monkeypatch):
+    """discover's Syft SBOM, package graph and class graph stay separate artifacts, referenced by hash."""
+    services = fake()
+    syft = b'{"bomFormat": "CycloneDX", "specVersion": "1.6", "components": []}'
+    pkg_graph = b'{"graph": {"schema": "guardian.package-graph/1"}, "links": [], "nodes": []}'
+    cls_graph = b'{"graph": {"schema": "guardian.class-graph/1", "status": "ok"}, "links": [], "nodes": [{"id": "a.A"}]}'
+
+    def call_discover(req):
+        services.calls.append(("discover", req.tree_artifact_sha256))
+        arts = {}
+        for name, blob in (("syft_sbom", syft), ("package_graph", pkg_graph), ("class_graph", cls_graph)):
+            arts[name] = {"sha256": artifact_store.put(req.run_id, "discover", "application/json", blob)}
+        arts["class_graph"].update({"status": "ok", "classes": 1})
+        dep_graph = {**MOCK_DEP_GRAPH, "graph": {**MOCK_DEP_GRAPH.get("graph", {}), "artifacts": arts}}
+        return DiscoverResponse(run_id=req.run_id, sbom_artifact_sha256=artifact_store.put(req.run_id, "discover",
+                                "application/vnd.cyclonedx+json", b"consensus"), dep_graph=dep_graph,
+                                coverage={"maven": "scanned"}, gate_passed=True)
+
+    monkeypatch.setattr(service_clients, "call_discover", call_discover)
+    run_id, data = _start()
+    assert set(data["artifacts"]) == {"sbom", "syft_sbom", "package_graph", "class_graph"}
+    assert len({a["sha256"] for a in data["artifacts"].values()}) == 4
+
+    # The hash-chained audit entry for discover references every artifact.
+    entry = next(e for e in RUNS_DB[run_id]["audit_log"] if e.get("stage") == "discover")
+    assert set(entry["artifacts"]) == {"sbom", "syft_sbom", "package_graph", "class_graph"}
+
+    listing = client.get(f"/runs/{run_id}/artifacts").json()
+    assert listing["syft_sbom"]["filename"] == "syft.cdx.json"
+    res = client.get(f"/runs/{run_id}/artifacts/syft_sbom")
+    assert res.status_code == 200 and res.content == syft
+    assert res.headers["x-artifact-sha256"] == sha(syft)
+    assert client.get(f"/runs/{run_id}/class-graph").json()["nodes"] == [{"id": "a.A"}]
+    assert client.get(f"/runs/{run_id}/artifacts/nope").status_code == 404
+    # State itself was not polluted with presentation fields.
+    assert "download" not in RUNS_DB[run_id]["dep_graph"]["graph"]["artifacts"]["syft_sbom"]
