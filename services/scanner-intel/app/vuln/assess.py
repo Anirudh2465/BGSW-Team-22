@@ -102,6 +102,8 @@ def assess_sbom(sbom_bytes: bytes, runs: Dict[str, ToolRun], feeds: Feeds) -> As
             "cwes": cwes,
             "weakness_category": weakness_category(cwes),
             "fix": fix_info(a.matches, comp.version),
+            # the advisory's own description (OSV preferred, then Grype); shown to humans, never sent to an LLM
+            "summary": next((m.summary for m in sorted(a.matches, key=lambda m: m.tool != "osv-scanner") if m.summary), ""),
         }
         v["explanation"] = explanation(v)
         vulns.append(v)

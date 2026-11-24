@@ -116,9 +116,10 @@ def run_stage(req: StageRunRequest):
             )
 
         if stage == "verify":
-            # Inputs by hash only: the source tarball and the patch artifact (never patch text in parameters).
+            # Inputs by hash only: the source tarball and, in verify mode, the patch artifact (never patch text).
+            # parameters.mode == "health": the standard checks on the untouched repo (no patch).
             res = run_stage4_verify(run_id=req.run_id, source_sha256=req.source_artifact_sha256 or "",
-                                    patch_sha256=req.patch_artifact_sha256 or "", parameters=req.parameters,
+                                    patch_sha256=req.patch_artifact_sha256 or None, parameters=req.parameters,
                                     runner=runner, store=store)
             return StageRunResponse(
                 run_id=req.run_id,
@@ -127,13 +128,15 @@ def run_stage(req: StageRunRequest):
                 artifact_sha256=res.get("bundle_sha256"),
                 metrics=res.get("metrics", {}),
                 details={
+                    "mode": res.get("mode"),
                     "patch_sha256": res.get("patch_sha256"),
                     "patch_applied": res.get("patch_applied", False),
                     "build_success": res.get("build_success", False),
                     "tests_found": res.get("tests_found", False),
                     "tests_success": res.get("tests_success"),
-                    "tests_preexisting_failures": res.get("tests_preexisting_failures", False),
                     "tests": res.get("tests", {}),
+                    "startup_ok": res.get("startup_ok"),
+                    "startup": res.get("startup", {}),
                     "resolved_version_matches": res.get("resolved_version_matches", False),
                     "resolved_checks": res.get("resolved_checks", []),
                     "sbom_generated": res.get("sbom_generated", False),

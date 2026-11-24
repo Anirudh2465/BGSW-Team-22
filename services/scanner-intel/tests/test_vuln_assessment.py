@@ -428,3 +428,13 @@ def test_assess_api_distinguishes_missing_sbom_from_storage_failure(wired, monke
         raise artifacts.ArtifactError("artifact upload rejected (HTTP 413)")
     monkeypatch.setattr(wired, "put", reject)
     assert TestClient(app).post("/assess", json={"run_id": "r1", "sbom_artifact_sha256": sha}).status_code == 502
+
+
+def test_advisory_summary_comes_from_the_scanners_and_reaches_the_enrichment(result):
+    from app.vuln.scanners import one_line
+    [v] = vulns_of(result.report, LOG4J, "CVE-2021-44228")
+    assert v["summary"] and "\n" not in v["summary"]
+    entry = json.loads(result.enrichment_json)["advisories"][v["finding_id"]]
+    assert entry["summary"] == v["summary"]
+    assert one_line("Remote **code** `injection`\n in [Log4j](x)") == "Remote code injection in Log4j(x)"
+    assert one_line(None) == "" and len(one_line("a" * 500)) == 300

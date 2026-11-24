@@ -125,6 +125,8 @@ def test_remediation_engine_pipeline_api(monkeypatch):
         "status": "success", "patch_sha256": rems[0]["patch_sha256"], "bundle_sha256": "b" * 64,
         "patch_applied": True, "build_success": True, "tests_found": False, "tests_success": None,
         "resolved_version_matches": True}
+    rems[0]["validation"]["health"] = {"status": "success", "build_success": True, "tests_found": False,
+                                       "tests_success": None, "tests": {}, "startup_ok": None}
     rems[0]["validation"]["rescan"] = {
         "status": "ok", "rescan_valid": True, "result_sha256": "r" * 64, "new_high_or_critical": 0,
         "new_advisories": [], "targets": [{"finding_id": "f1", "still_present": False}]}

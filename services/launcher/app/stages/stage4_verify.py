@@ -1,32 +1,33 @@
-"""Stage 4: verify a remediation patch in a throwaway build sandbox (Invariant 2, verify before approval).
+"""Stage 4: the standard repo checks, in a throwaway build sandbox (Invariant 2, verify before approval).
 
-Inputs arrive by SHA-256 only: the stage-1 source tarball and the remediation patch (a unified diff over
-dependency manifests). Both must already be in the launcher's artifact store (the orchestrator pushes them).
+One fixed suite, run in two modes:
 
-In the sandbox (allowlisted ``verify`` image, egress only through the allowlist proxy, no sinkhole pass):
-1. unpack the clean source, ``git apply --check`` the patch (``patch -p1 --dry-run`` as fallback), apply it
-2. Syft CycloneDX SBOM of the patched tree (``dir:`` scan, same tool and version as stage 3)
-3. per ecosystem the patch touches:
-   - Maven: ``mvn test-compile`` (build), ``maven-dependency-plugin:3.8.1:tree -DoutputType=json`` (resolved
-     versions, same plugin as stage 2), ``mvn test``; Surefire reports are kept
-   - npm: ``npm install --package-lock-only`` then ``npm ci`` (both ``--ignore-scripts``: install hooks only ever
-     run in stage 2's hook-observe pass), ``npm run build`` if present, ``npm ls --all --json``, ``npm test``
-     when the project has a real test script
-   - pip: a venv, ``pip install -r``, ``pip install --dry-run --report`` (resolved set), ``pytest`` when the
-     project has test files
-4. every step records exit code, duration and a scrubbed log
+- ``health`` (once per scan, on the untouched repo): what the repo can do before anything is changed. It is
+  the reference every fix is compared with.
+- ``verify`` (only when a human clicks "Verify fix"): the same suite on a clean copy with the remediation
+  patch applied (inputs by SHA-256; only in-place edits of dependency manifests are accepted).
 
-A project without tests is reported as ``tests_found=false`` -- never as "tests passed". The launcher only
-reports facts; whether the remediation is verified is decided by remediation-engine's Verification gate.
+The suite, per ecosystem found (verify: the ones the patch touches; health: every one in the repo):
+  1. install    dependencies through the allowlist proxy (npm/pip with ``--ignore-scripts`` where possible:
+                install hooks only ever run in stage 2's sinkhole pass)
+  2. build      Maven ``package -DskipTests`` / ``npm ci`` + ``npm run build`` / ``pip install -r``
+  3. resolve    the resolved dependency tree (same plugin as stage 2), to prove the upgraded version
+  4. tests      the project's own tests; every failing test case is recorded by ID (JUnit reports)
+  5. start-up   start the application for up to ``STARTUP_WINDOW_S`` seconds: it passes if it prints a
+                ready marker, is still running at the end, or exits 0; it fails if it crashes. Projects with
+                no runnable artifact or start command are "not applicable"
+plus a Syft SBOM of the tree for the rescan. Every step records exit code, duration and a scrubbed log.
 
-Output: a verification bundle artifact laid out like the stage-2/3 bundles, so scanner-intel can rebuild the
-patched SBOM with the same merge code as discover::
+The launcher reports facts only. Comparing a fix with the health check (no new failing test, still builds,
+still starts) is the Verification gate's job in remediation-engine.
 
-    resolved/<ecosystem>/<module>.json   resolver output of the patched tree
-    sbom/syft.cdx.json                   Syft SBOM of the patched tree
+Output bundle (laid out like the stage-2/3 bundles, so scanner-intel can rebuild the SBOM with discover):
+    resolved/<ecosystem>/<module>.json   resolver output
+    sbom/syft.cdx.json                   Syft SBOM
     tests/<ecosystem>/<module>/...       JUnit XML reports
+    startup/<step>.txt                   start-up result
     logs/<step>.log                      scrubbed step logs
-    manifest.json                        every step's status and the derived results
+    manifest.json                        every step's status and the derived facts
 """
 
 import hashlib
@@ -45,23 +46,44 @@ from .common import is_vendored, sandbox_output_files, tail
 # Architecture limits for a stage: 10 min wall clock (CPU / RAM / disk come from DockerRunner).
 VERIFY_TIMEOUT_S = int(os.getenv("STAGE4_TIMEOUT_S", "600"))
 STEP_TIMEOUT_S = int(os.getenv("STAGE4_STEP_TIMEOUT_S", "540"))
+STARTUP_WINDOW_S = int(os.getenv("STAGE4_STARTUP_WINDOW_S", "60"))
 MAVEN_DEPENDENCY_PLUGIN = "org.apache.maven.plugins:maven-dependency-plugin:3.8.1:tree"
 MAX_PATCH_BYTES = 256 * 1024
 MAX_LOG_BYTES = 512 * 1024
+MAX_HEALTH_MODULES = 5   # npm package.json / requirements files built in a health check
 NPM_DEFAULT_TEST = 'echo "Error: no test specified" && exit 1'
 SAFE_DIR = re.compile(r"^[A-Za-z0-9._/@+-]*$")
+# Lines that show an application finished starting (Spring Boot, Tomcat/Netty, Node/Express, Uvicorn, Flask...).
+READY_PATTERN = (r"Started [A-Za-z0-9_$.]+ in [0-9.]+ seconds|Tomcat started on port|Netty started on port|"
+                 r"Jetty started on port|[Ll]istening on|Server (is )?running|Running on http|"
+                 r"Application startup complete|ready in [0-9]")
 
 VERIFY_SCRIPT = r"""
 set -u
 exec 3>&1 1>&2
 OUT=/workspace/out
-mkdir -p "$HOME" /workspace/in "$OUT/logs" "$OUT/resolved" "$OUT/sbom" "$OUT/tests" /workspace/m2
+mkdir -p "$HOME" /workspace/in "$OUT/logs" "$OUT/resolved" "$OUT/sbom" "$OUT/tests" "$OUT/startup" /workspace/m2
 STEPS="$OUT/steps.txt"
 : > "$STEPS"
 up() { cut -d' ' -f1 /proc/uptime; }
 step() { name=$1; shift; s=$(up)
   timeout "$GUARDIAN_STEP_TIMEOUT" "$@" > "$OUT/logs/$name.log" 2>&1; rc=$?
   echo "$name $rc $s $(up)" >> "$STEPS"; return $rc; }
+# Start the application in the background for at most GUARDIAN_STARTUP_WINDOW seconds and record how it went:
+# "ready" (a ready marker was printed), "alive" (still running at the end), "exited <rc>" (it stopped by itself).
+startup() { name=$1; shift; s=$(up); log="$OUT/logs/$name.log"
+  "$@" > "$log" 2>&1 &
+  pid=$!; res=""; i=0
+  while [ "$i" -lt "$GUARDIAN_STARTUP_WINDOW" ]; do
+    if grep -qE "$GUARDIAN_READY_PATTERN" "$log" 2>/dev/null; then res="ready"; break; fi
+    if ! kill -0 "$pid" 2>/dev/null; then wait "$pid"; res="exited $?"; break; fi
+    sleep 1; i=$((i + 1))
+  done
+  [ -z "$res" ] && res="alive"
+  kill "$pid" 2>/dev/null; sleep 1; kill -9 "$pid" 2>/dev/null
+  echo "$res" > "$OUT/startup/$name.txt"
+  echo "$name 0 $s $(up)" >> "$STEPS"; }
+not_applicable() { echo "not_applicable $2" > "$OUT/startup/$1.txt"; }
 finish() { tar -cf - -C "$OUT" . >&3; exit 0; }
 modname() { d="${1#./}"; [ "$d" = "." ] || [ -z "$d" ] && d=root; echo "$d" | sed 's#/#__#g'; }
 has() { case " $GUARDIAN_ECOSYSTEMS " in *" $1 "*) return 0;; esac; return 1; }
@@ -74,26 +96,25 @@ SRC=/workspace/in/src
 PATCH=/workspace/in/patch.diff
 cd "$SRC" || finish
 
-# 1. apply the patch to the clean tree (git apply first, GNU patch as fallback)
-s=$(up)
-if git apply --check -v "$PATCH" > "$OUT/logs/patch.check.log" 2>&1; then
-  echo "patch.check 0 $s $(up)" >> "$STEPS"
-  step patch.apply git apply -v "$PATCH" || finish
-  REVERT="git apply -R -v $PATCH"
-elif patch -p1 --dry-run -i "$PATCH" >> "$OUT/logs/patch.check.log" 2>&1; then
-  echo "patch.check 0 $s $(up)" >> "$STEPS"
-  step patch.apply patch -p1 -i "$PATCH" || finish
-  REVERT="patch -R -p1 -i $PATCH"
-else
-  echo "patch.check 1 $s $(up)" >> "$STEPS"
-  finish
+# 1. verify mode: apply the patch to the clean tree (git apply first, GNU patch as fallback)
+if [ "$GUARDIAN_MODE" = "verify" ]; then
+  s=$(up)
+  if git apply --check -v "$PATCH" > "$OUT/logs/patch.check.log" 2>&1; then
+    echo "patch.check 0 $s $(up)" >> "$STEPS"
+    step patch.apply git apply -v "$PATCH" || finish
+  elif patch -p1 --dry-run -i "$PATCH" >> "$OUT/logs/patch.check.log" 2>&1; then
+    echo "patch.check 0 $s $(up)" >> "$STEPS"
+    step patch.apply patch -p1 -i "$PATCH" || finish
+  else
+    echo "patch.check 1 $s $(up)" >> "$STEPS"
+    finish
+  fi
 fi
 
-# 2. SBOM of the patched tree, before any build output exists (same view as stage 3)
+# 2. SBOM of the tree, before any build output exists (same view as stage 3)
 step sbom.syft syft scan "dir:$SRC" -q -o "cyclonedx-json=$OUT/sbom/syft.cdx.json"
 
-# 3a. Maven
-FAILED_TESTS=""   # ecosystems whose tests failed on the patched tree: re-run on the original tree below
+# 3a. Maven: package, resolve, test, start
 if has maven; then
   mkdir -p "$OUT/resolved/maven" "$OUT/tests/maven"
   cat > "$HOME/settings.xml" <<EOF
@@ -103,30 +124,42 @@ if has maven; then
 </proxies></settings>
 EOF
   export MAVEN_OPTS="-Xmx1024m -XX:-UsePerfData"
+  MVN="mvn -B -s $HOME/settings.xml -Dmaven.repo.local=/workspace/m2 -Dstyle.color=never"
   cd "$SRC/$GUARDIAN_MAVEN_DIR"
-  step maven.build.root mvn -B -s "$HOME/settings.xml" -Dmaven.repo.local=/workspace/m2 -Dstyle.color=never \
-      -DskipTests test-compile
+  step maven.build.root $MVN -DskipTests package
   BUILD_RC=$?
-  step maven.resolve.root mvn -B -q -s "$HOME/settings.xml" -Dmaven.repo.local=/workspace/m2 \
-      "$GUARDIAN_MAVEN_PLUGIN" -DoutputType=json -DoutputFile=guardian-tree.json
+  step maven.resolve.root $MVN -q "$GUARDIAN_MAVEN_PLUGIN" -DoutputType=json -DoutputFile=guardian-tree.json
   find . -name guardian-tree.json -not -path '*/node_modules/*' | while IFS= read -r f; do
     d=$(dirname "$f"); d="${d#./}"
     if [ "$GUARDIAN_MAVEN_DIR" = "." ]; then rel="$d"; elif [ "$d" = "." ]; then rel="$GUARDIAN_MAVEN_DIR"; else rel="$GUARDIAN_MAVEN_DIR/$d"; fi
     cp "$f" "$OUT/resolved/maven/$(modname "$rel").json"
   done
   if [ "$BUILD_RC" = 0 ]; then
-    step maven.test.root mvn -B -s "$HOME/settings.xml" -Dmaven.repo.local=/workspace/m2 -Dstyle.color=never test \
-      || FAILED_TESTS="$FAILED_TESTS maven"
+    step maven.test.root $MVN test
     find . -path '*/target/surefire-reports/TEST-*.xml' -not -path '*/node_modules/*' | while IFS= read -r f; do
       m=$(modname "$(dirname "$(dirname "$(dirname "$f")")")")
       mkdir -p "$OUT/tests/maven/$m"
       cp "$f" "$OUT/tests/maven/$m/"
     done
+    # start-up: the first runnable jar (Main-Class in its manifest); Spring Boot gets a random port
+    JAR=""
+    for j in $(find . -path '*/target/*.jar' -not -name '*-sources.jar' -not -name '*-javadoc.jar' \
+                 -not -name '*-tests.jar' -not -name 'original-*' | sort); do
+      if unzip -p "$j" META-INF/MANIFEST.MF 2>/dev/null | grep -q '^Main-Class:'; then JAR="$j"; break; fi
+    done
+    if [ -n "$JAR" ]; then
+      ARGS=""; unzip -p "$JAR" META-INF/MANIFEST.MF 2>/dev/null | grep -q '^Start-Class:' && ARGS="--server.port=0"
+      JAVA_TOOL_OPTIONS="-Xmx512m" startup maven.startup.root java -jar "$JAR" $ARGS
+    else
+      not_applicable maven.startup.root "no runnable jar (library project)"
+    fi
+  else
+    not_applicable maven.startup.root "the build failed"
   fi
   cd "$SRC"
 fi
 
-# 3b. npm (scripts never run here; hooks are observed only in stage 2's sinkhole pass)
+# 3b. npm (install scripts never run here; hooks are observed only in stage 2's sinkhole pass)
 if has npm; then
   mkdir -p "$OUT/resolved/npm"
   export npm_config_proxy="$HTTP_PROXY" npm_config_https_proxy="$HTTPS_PROXY" npm_config_audit=false \
@@ -137,7 +170,11 @@ if has npm; then
        && step "npm.build.$n" npm ci --ignore-scripts; then
       if in_list "$d" "$GUARDIAN_NPM_BUILD_DIRS"; then step "npm.buildscript.$n" npm run build; fi
       step "npm.resolve.$n" sh -c "npm ls --all --json > '$OUT/resolved/npm/$n.json'"
-      if in_list "$d" "$GUARDIAN_NPM_TEST_DIRS"; then step "npm.test.$n" npm test || FAILED_TESTS="$FAILED_TESTS npm:$d"; fi
+      if in_list "$d" "$GUARDIAN_NPM_TEST_DIRS"; then step "npm.test.$n" npm test; fi
+      if in_list "$d" "$GUARDIAN_NPM_START_DIRS"; then PORT=0 startup "npm.startup.$n" npm start
+      else not_applicable "npm.startup.$n" "no start script"; fi
+    else
+      not_applicable "npm.startup.$n" "the install failed"
     fi
     cd "$SRC"
   done
@@ -158,47 +195,16 @@ if has pypi; then
         "$venv/bin/python" -c "import pytest" 2>/dev/null || step "pypi.testdeps.$n" "$venv/bin/pip" install pytest
         cd "$SRC"
         step "pypi.test.$n" "$venv/bin/python" -m pytest -q -p no:cacheprovider --junitxml="$OUT/tests/pypi/$n.xml"
-        rc=$?; [ "$rc" != 0 ] && [ "$rc" != 5 ] && FAILED_TESTS="$FAILED_TESTS pypi:$rq"
+        cd "$SRC/$d"
       fi
+      if [ -f manage.py ]; then startup "pypi.startup.$n" "$venv/bin/python" manage.py check
+      elif [ -f app.py ]; then startup "pypi.startup.$n" "$venv/bin/python" app.py
+      elif [ -f main.py ]; then startup "pypi.startup.$n" "$venv/bin/python" main.py
+      else not_applicable "pypi.startup.$n" "no manage.py, app.py or main.py"; fi
+    else
+      not_applicable "pypi.startup.$n" "the install failed"
     fi
     cd "$SRC"
-  done
-fi
-
-# 4. Baseline: only when tests failed on the patched tree. Revert the patch and run the same tests on the
-#    original code, so the gate can tell failures the patch caused from failures the project already had
-#    (e.g. tests that need a database the sandbox does not provide).
-if [ -n "$FAILED_TESTS" ]; then
-  cd "$SRC" && step baseline.revert $REVERT || finish
-  for t in $FAILED_TESTS; do
-    case "$t" in
-      maven)
-        cd "$SRC/$GUARDIAN_MAVEN_DIR"
-        find . -path '*/target/surefire-reports' -type d -prune -exec rm -rf {} + 2>/dev/null
-        step maven.basetest.root mvn -B -s "$HOME/settings.xml" -Dmaven.repo.local=/workspace/m2 -Dstyle.color=never test
-        find . -path '*/target/surefire-reports/TEST-*.xml' -not -path '*/node_modules/*' | while IFS= read -r f; do
-          m=$(modname "$(dirname "$(dirname "$(dirname "$f")")")")
-          mkdir -p "$OUT/baseline/maven/$m"
-          cp "$f" "$OUT/baseline/maven/$m/"
-        done
-        cd "$SRC";;
-      npm:*)
-        d="${t#npm:}"; n=$(modname "$d"); cd "$SRC/$d" || continue
-        step "npm.baselock.$n" npm install --package-lock-only --ignore-scripts \
-          && step "npm.basebuild.$n" npm ci --ignore-scripts \
-          && step "npm.basetest.$n" npm test
-        cd "$SRC";;
-      pypi:*)
-        rq="${t#pypi:}"; d=$(dirname "$rq"); n="$(modname "$d")__$(basename "$rq" .txt)"; venv="/workspace/venvb-$n"
-        mkdir -p "$OUT/baseline/pypi"; cd "$SRC/$d" || continue
-        if step "pypi.basevenv.$n" python3 -m venv "$venv" \
-           && step "pypi.basebuild.$n" "$venv/bin/pip" install -r "$(basename "$rq")"; then
-          "$venv/bin/python" -c "import pytest" 2>/dev/null || "$venv/bin/pip" install -q pytest
-          cd "$SRC"
-          step "pypi.basetest.$n" "$venv/bin/python" -m pytest -q -p no:cacheprovider --junitxml="$OUT/baseline/pypi/$n.xml"
-        fi
-        cd "$SRC";;
-    esac
   done
 fi
 finish
@@ -302,12 +308,23 @@ def _npm_scripts(members: Dict[str, bytes], path: str) -> Dict[str, str]:
     return {k: v for k, v in (scripts or {}).items() if isinstance(k, str) and isinstance(v, str)}
 
 
+def health_manifests(members: Dict[str, bytes]) -> List[str]:
+    """Health mode builds the repo as it is: the shallowest pom.xml, and up to MAX_HEALTH_MODULES package.json
+    and requirements files (shallowest first), never vendored copies."""
+    candidates = sorted((p for p in members if is_dependency_manifest(p) and not is_vendored(p)),
+                        key=lambda p: (p.count("/"), p))
+    poms = [p for p in candidates if manifest_ecosystem(p) == "maven"][:1]
+    npm = [p for p in candidates if manifest_ecosystem(p) == "npm"][:MAX_HEALTH_MODULES]
+    pypi = [p for p in candidates if manifest_ecosystem(p) == "pypi"][:MAX_HEALTH_MODULES]
+    return poms + npm + pypi
+
+
 def plan_build(paths: List[str], members: Dict[str, bytes]) -> Dict[str, Any]:
-    """What the sandbox runs, from the patched manifests and the source file list (no parsing of code)."""
+    """What the sandbox runs, from the manifests to build and the source file list (no parsing of code)."""
     all_paths = list(members)
     ecosystems = sorted({manifest_ecosystem(p) for p in paths})
     plan: Dict[str, Any] = {"ecosystems": ecosystems, "maven_dir": ".", "npm_dirs": [], "npm_build_dirs": [],
-                            "npm_test_dirs": [], "pypi_reqs": [], "tests_expected": {}}
+                            "npm_test_dirs": [], "npm_start_dirs": [], "pypi_reqs": [], "tests_expected": {}}
     if "maven" in ecosystems:
         poms = [p for p in paths if manifest_ecosystem(p) == "maven"]
         # a root pom builds the whole reactor; otherwise build the patched module
@@ -322,13 +339,17 @@ def plan_build(paths: List[str], members: Dict[str, bytes]) -> Dict[str, Any]:
             plan["npm_build_dirs"].append(d)
         if scripts.get("test", "").strip() and scripts["test"].strip() != NPM_DEFAULT_TEST:
             plan["npm_test_dirs"].append(d)
+        if scripts.get("start", "").strip():
+            plan["npm_start_dirs"].append(d)
         plan["tests_expected"][f"npm:{d}"] = d in plan["npm_test_dirs"]
     plan["pypi_reqs"] = sorted(p for p in paths if manifest_ecosystem(p) == "pypi")
     if plan["pypi_reqs"]:
         plan["tests_expected"]["pypi"] = _has_python_tests(all_paths)
-    for key in ("npm_dirs", "npm_build_dirs", "npm_test_dirs", "pypi_reqs"):
+    for key in ("npm_dirs", "npm_build_dirs", "npm_test_dirs", "npm_start_dirs", "pypi_reqs"):
         if any(not SAFE_DIR.match(x) for x in plan[key]):
             raise PatchRefused("manifest path contains characters the sandbox script does not accept")
+    if not SAFE_DIR.match(plan["maven_dir"]):
+        raise PatchRefused("manifest path contains characters the sandbox script does not accept")
     return plan
 
 
@@ -377,28 +398,22 @@ def junit_failing(files: Dict[str, bytes]) -> List[str]:
     return sorted(out)
 
 
-def baseline_result(steps: Dict[str, Dict[str, Any]], out: Dict[str, bytes], step: str, patched_prefix: str,
-                    base_prefix: Optional[str]) -> Dict[str, Any]:
-    """Compare a failed patched test run with the same tests on the original tree (pure).
-
-    preexisting_only = the baseline ran, also failed, and no test fails that did not fail before the patch.
-    With JUnit reports the comparison is per test case; without them (npm) it is by exit code only."""
-    base = steps.get(step)
-    if base is None:
-        return {"ran": False, "preexisting_only": False, "reason": "baseline tests did not run"}
-    base_failed = base["exit_code"] not in (0, 5)
-    if base_prefix is None:
-        return {"ran": True, "base_exit_code": base["exit_code"], "compared_by": "exit_code",
-                "new_failures": [], "preexisting_only": base_failed}
-    patched = set(junit_failing({p: d for p, d in out.items() if p.startswith(patched_prefix)}))
-    before = set(junit_failing({p: d for p, d in out.items() if p.startswith(base_prefix)}))
-    if not patched:  # failed without any failing test case on record: fall back to the exit codes
-        return {"ran": True, "base_exit_code": base["exit_code"], "compared_by": "exit_code",
-                "new_failures": [], "preexisting_only": base_failed, "baseline_failing": sorted(before)[:50]}
-    new = sorted(patched - before)
-    return {"ran": True, "base_exit_code": base["exit_code"], "compared_by": "test_case",
-            "patched_failing": sorted(patched)[:50], "baseline_failing": sorted(before)[:50],
-            "new_failures": new[:50], "preexisting_only": base_failed and not new}
+def parse_startup(text: str) -> Dict[str, Any]:
+    """'ready' | 'alive' | 'exited <rc>' | 'not_applicable <reason>' -> {status, ok, exit_code, reason}."""
+    text = (text or "").strip()
+    if text == "ready":
+        return {"status": "ready", "ok": True}
+    if text == "alive":
+        return {"status": "alive", "ok": True}
+    if text.startswith("exited"):
+        try:
+            rc = int(text.split()[1])
+        except (IndexError, ValueError):
+            rc = -1
+        return {"status": "exited", "exit_code": rc, "ok": rc == 0}
+    if text.startswith("not_applicable"):
+        return {"status": "not_applicable", "ok": None, "reason": text[len("not_applicable"):].strip() or None}
+    return {"status": "unknown", "ok": None, "reason": "no start-up result recorded"}
 
 
 def _parse_purl(purl: str) -> Optional[Tuple[str, str, str, str]]:
@@ -476,8 +491,13 @@ def check_resolved(target_purls: List[str], files: Dict[str, bytes]) -> Tuple[bo
     return bool(checks) and all(c["matches"] for c in checks), checks
 
 
+def _module_key(rq: str) -> str:
+    mod = "root" if posixpath.dirname(rq) in ("", ".") else posixpath.dirname(rq).replace("/", "__")
+    return f"{mod}__{posixpath.splitext(posixpath.basename(rq))[0]}"
+
+
 def summarise(plan: Dict[str, Any], steps: Dict[str, Dict[str, Any]], out: Dict[str, bytes],
-              target_purls: List[str], timed_out: bool) -> Dict[str, Any]:
+              target_purls: List[str], timed_out: bool, mode: str = "verify") -> Dict[str, Any]:
     """Facts about the run, derived only from step exit codes and the files the sandbox wrote."""
 
     def ok(name: str) -> Optional[bool]:
@@ -485,36 +505,54 @@ def summarise(plan: Dict[str, Any], steps: Dict[str, Dict[str, Any]], out: Dict[
         return None if s is None else s["exit_code"] == 0
 
     errors: List[str] = []
-    patch_applied = ok("patch.apply") is True
-    if not patch_applied:
-        errors.append("patch did not apply to the clean source" if ok("patch.check") is False
-                      else "patch step did not run")
+    if mode == "verify":
+        patch_applied: Optional[bool] = ok("patch.apply") is True
+        if not patch_applied:
+            errors.append("patch did not apply to the clean source" if ok("patch.check") is False
+                          else "patch step did not run")
+    else:
+        patch_applied = None  # health check: nothing to apply
 
     build_parts: List[bool] = []
     tests: Dict[str, Dict[str, Any]] = {}
+    startup: Dict[str, Dict[str, Any]] = {}
     junit = {p: d for p, d in out.items() if p.startswith("tests/") and p.endswith(".xml")}
 
-    def test_result(key: str, step: str, report_prefix: str, expected: bool):
-        st = ok(step)
-        counts = junit_counts({p: d for p, d in junit.items() if p.startswith(report_prefix)})
+    def record_startup(key: str, step: str):
+        raw = out.get(f"startup/{step}.txt")
+        startup[key] = {"step": step, **(parse_startup(raw.decode("utf-8", errors="replace")) if raw is not None
+                                         else {"status": "not_run", "ok": None, "reason": "the step did not run"})}
+
+    def test_result(key: str, step: str, report_prefix: str, expected: bool, exact: bool = False,
+                    by_exit_code: bool = False):
+        st = steps.get(step)
+        reports = {p: d for p, d in junit.items() if (p == report_prefix if exact else p.startswith(report_prefix))}
+        counts = junit_counts(reports)
+        failing = junit_failing(reports)
         ran = counts["tests"] - counts["skipped"]
         if st is None:  # never ran (the build failed first): unknown, not "failed"
             found, success = expected, None
-        elif st:
-            found = ran > 0
+        elif by_exit_code and not reports:  # npm test: a real test script, judged by its exit code
+            found, success = True, st["exit_code"] == 0
+        elif st["exit_code"] == 0:
+            found = ran > 0   # never "passed" without a test that actually ran
             success = (counts["failures"] + counts["errors"] == 0) if found else None
+        elif st["exit_code"] == 5 and key.startswith("pypi:"):  # pytest: no tests collected
+            found, success = False, None
         else:
             found = expected or ran > 0
             success = False
-        tests[key] = {"step": step, "found": found, "success": success, "expected": expected, **counts}
+        tests[key] = {"step": step, "found": found, "success": success, "expected": expected,
+                      "failing": failing[:200], "compared_by": "test_case" if reports else "exit_code", **counts}
         return st
 
     if "maven" in plan["ecosystems"]:
         build_parts.append(ok("maven.build.root") is True)
         st = test_result("maven", "maven.test.root", "tests/maven/", plan["tests_expected"].get("maven", False))
-        if st is False and not tests["maven"]["found"]:
+        if st is not None and st["exit_code"] != 0 and not tests["maven"]["found"]:
             build_parts.append(False)  # mvn test failed without any test involved: a build problem
             errors.append("mvn test failed before any test ran")
+        record_startup("maven", "maven.startup.root")
     for d in plan["npm_dirs"]:
         n = "root" if d in (".", "") else d.replace("/", "__")
         parts = [ok(f"npm.lock.{n}"), ok(f"npm.build.{n}")]
@@ -522,82 +560,61 @@ def summarise(plan: Dict[str, Any], steps: Dict[str, Dict[str, Any]], out: Dict[
             parts.append(ok(f"npm.buildscript.{n}"))
         build_parts.append(all(p is True for p in parts))
         if d in plan["npm_test_dirs"]:
-            st = ok(f"npm.test.{n}")
-            tests[f"npm:{d}"] = {"step": f"npm.test.{n}", "found": True,
-                                 "success": None if st is None else st, "expected": True}
+            test_result(f"npm:{d}", f"npm.test.{n}", "__none__", True, exact=True, by_exit_code=True)
         else:
-            tests[f"npm:{d}"] = {"step": None, "found": False, "success": None, "expected": False}
+            tests[f"npm:{d}"] = {"step": None, "found": False, "success": None, "expected": False, "failing": [],
+                                 "compared_by": "exit_code"}
+        record_startup(f"npm:{d}", f"npm.startup.{n}")
     for rq in plan["pypi_reqs"]:
-        n = f"{'root' if posixpath.dirname(rq) in ('', '.') else posixpath.dirname(rq).replace('/', '__')}__" \
-            f"{posixpath.splitext(posixpath.basename(rq))[0]}"
+        n = _module_key(rq)
         build_parts.append(ok(f"pypi.venv.{n}") is True and ok(f"pypi.build.{n}") is True)
         if plan["tests_expected"].get("pypi"):
-            st = steps.get(f"pypi.test.{n}")
-            counts = junit_counts({p: d for p, d in junit.items() if p == f"tests/pypi/{n}.xml"})
-            if st is None:
-                tests[f"pypi:{rq}"] = {"step": f"pypi.test.{n}", "found": True, "success": None, "expected": True,
-                                       **counts}
-            elif st["exit_code"] == 5:  # pytest: no tests collected
-                tests[f"pypi:{rq}"] = {"step": f"pypi.test.{n}", "found": False, "success": None, "expected": True,
-                                       **counts}
-            else:
-                tests[f"pypi:{rq}"] = {"step": f"pypi.test.{n}", "found": True, "success": st["exit_code"] == 0,
-                                       "expected": True, **counts}
+            test_result(f"pypi:{rq}", f"pypi.test.{n}", f"tests/pypi/{n}.xml", True, exact=True)
         else:
-            tests[f"pypi:{rq}"] = {"step": None, "found": False, "success": None, "expected": False}
+            tests[f"pypi:{rq}"] = {"step": None, "found": False, "success": None, "expected": False, "failing": [],
+                                   "compared_by": "exit_code"}
+        record_startup(f"pypi:{rq}", f"pypi.startup.{n}")
 
-    build_success = patch_applied and bool(build_parts) and all(build_parts) and not timed_out
-    if patch_applied and not build_success:
-        failed = [n for n, s in steps.items() if s["exit_code"] != 0 and ".test." not in n and n != "sbom.syft"
-                  and ".base" not in n and not n.startswith("baseline.")]
+    build_success = (patch_applied is not False) and bool(build_parts) and all(build_parts) and not timed_out
+    if patch_applied is not False and not build_success:
+        failed = [n for n, s in steps.items() if s["exit_code"] != 0 and ".test." not in n and n != "sbom.syft"]
         errors.append(f"build failed: {', '.join(failed) or 'no build step completed'}")
     tests_found = any(t["found"] for t in tests.values())
-    # Failed tests are re-run on the original tree (step 4 of the script): attach that comparison.
-    for key, t in tests.items():
-        if not (t["found"] and t["success"] is False):
-            continue
-        if key == "maven":
-            t["baseline"] = baseline_result(steps, out, "maven.basetest.root", "tests/maven/", "baseline/maven/")
-        elif key.startswith("npm:"):
-            d = key[4:]
-            n = "root" if d in (".", "") else d.replace("/", "__")
-            t["baseline"] = baseline_result(steps, out, f"npm.basetest.{n}", "", None)
-        elif key.startswith("pypi:"):
-            rq = key[5:]
-            mod = "root" if posixpath.dirname(rq) in ("", ".") else posixpath.dirname(rq).replace("/", "__")
-            n = f"{mod}__{posixpath.splitext(posixpath.basename(rq))[0]}"
-            t["baseline"] = baseline_result(steps, out, f"pypi.basetest.{n}", f"tests/pypi/{n}.xml",
-                                            f"baseline/pypi/{n}.xml")
-
     # None = no tests, or they never ran because the build failed first
     tests_success: Optional[bool] = None
-    tests_preexisting = False
     found = [t for t in tests.values() if t["found"]]
-    failing = {k: t for k, t in tests.items() if t["found"] and t["success"] is False}
-    if failing:
+    if any(t["success"] is False for t in found):
         tests_success = False
-        tests_preexisting = all((t.get("baseline") or {}).get("preexisting_only") for t in failing.values())
-        if not tests_preexisting:
-            new = {k: (t.get("baseline") or {}).get("new_failures") or [] for k, t in failing.items()}
-            errors.append("tests failed: " + ", ".join(
-                f"{k} ({len(v)} new failing test{'s' if len(v) != 1 else ''})" if v else k for k, v in new.items()))
+        errors.append("tests failed: " + ", ".join(
+            f"{k} ({len(t['failing'])} failing)" if t["failing"] else k
+            for k, t in tests.items() if t["found"] and t["success"] is False))
     elif found and all(t["success"] is True for t in found):
         tests_success = True
-    resolved_ok, resolved_checks = check_resolved(target_purls, out) if build_success else (False, [])
-    if build_success and not resolved_ok:
-        errors.append("resolved version check failed: " + "; ".join(
-            f"{c['purl']}: {c['reason']}" for c in resolved_checks if not c["matches"]))
+    applicable = [s for s in startup.values() if s["ok"] is not None]
+    startup_ok: Optional[bool] = None if not applicable else all(s["ok"] for s in applicable)
+    if startup_ok is False:
+        errors.append("the application did not start: " + ", ".join(
+            f"{k} ({s['status']}{' ' + str(s.get('exit_code')) if s.get('exit_code') is not None else ''})"
+            for k, s in startup.items() if s["ok"] is False))
+    if target_purls:
+        resolved_ok, resolved_checks = check_resolved(target_purls, out) if build_success else (False, [])
+        if build_success and not resolved_ok:
+            errors.append("resolved version check failed: " + "; ".join(
+                f"{c['purl']}: {c['reason']}" for c in resolved_checks if not c["matches"]))
+    else:
+        resolved_ok, resolved_checks = None, []
     sbom_ok = bool(out.get("sbom/syft.cdx.json", b"").strip())
     if timed_out:
-        errors.insert(0, f"verification exceeded the {VERIFY_TIMEOUT_S}s stage limit")
+        errors.insert(0, f"the checks exceeded the {VERIFY_TIMEOUT_S}s stage limit")
     return {
+        "mode": mode,
         "patch_applied": patch_applied,
         "build_success": build_success,
         "tests_found": tests_found,
         "tests_success": tests_success,
-        # tests fail on the patched tree, but the same tests fail without the patch and no new test fails
-        "tests_preexisting_failures": tests_preexisting,
         "tests": tests,
+        "startup_ok": startup_ok,
+        "startup": startup,
         "resolved_version_matches": resolved_ok,
         "resolved_checks": resolved_checks,
         "sbom_generated": sbom_ok,
@@ -606,43 +623,55 @@ def summarise(plan: Dict[str, Any], steps: Dict[str, Dict[str, Any]], out: Dict[
 
 
 # ----------------------------------------------------------------------------- stage entry
-def run_stage4_verify(run_id: str, source_sha256: str, patch_sha256: str, parameters: Dict[str, Any],
+def run_stage4_verify(run_id: str, source_sha256: str, patch_sha256: Optional[str], parameters: Dict[str, Any],
                       runner: Optional[DockerRunner] = None,
                       store: Optional[LocalArtifactStore] = None) -> Dict[str, Any]:
+    """Run the standard checks. ``parameters["mode"] == "health"``: the untouched repo (no patch). Otherwise
+    the verify mode: the patch (by hash) applied first, and the target purls' resolved versions checked."""
     runner = runner or DockerRunner()
     store = store or default_store
+    mode = "health" if parameters.get("mode") == "health" else "verify"
     target_purls = [p for p in (parameters.get("target_purls") or []) if isinstance(p, str)]
 
     def refused(reason: str) -> Dict[str, Any]:
-        return {"status": "error", "error": reason, "patch_sha256": patch_sha256, "build_success": False,
-                "tests_found": False, "tests_success": None, "resolved_version_matches": False, "metrics": {}}
+        return {"status": "error", "mode": mode, "error": reason, "patch_sha256": patch_sha256,
+                "build_success": False, "tests_found": False, "tests_success": None, "startup_ok": None,
+                "resolved_version_matches": False, "metrics": {}}
 
     source = store.get(source_sha256) if source_sha256 else None
     if source is None:
         return refused(f"source artifact {source_sha256!r} not present on launcher")
-    patch = store.get(patch_sha256) if patch_sha256 else None
-    if patch is None:
-        return refused(f"patch artifact {patch_sha256!r} not present on launcher")
-    actual = hashlib.sha256(patch).hexdigest()
-    expected = parameters.get("expected_patch_sha256") or patch_sha256
-    if actual != patch_sha256 or actual != expected:
-        return refused(f"patch SHA-256 mismatch: expected {expected}, got {actual}")
-    if len(patch) > MAX_PATCH_BYTES:
-        return refused("patch is larger than a manifest edit can be")
-    if not target_purls:
-        return refused("no target purl given: the resolved version cannot be checked")
-
     members = read_members(source)
+    patch = b""
     try:
-        paths = validate_patch(patch.decode("utf-8"), members.keys())
+        if mode == "verify":
+            patch = store.get(patch_sha256) if patch_sha256 else None
+            if patch is None:
+                return refused(f"patch artifact {patch_sha256!r} not present on launcher")
+            actual = hashlib.sha256(patch).hexdigest()
+            expected = parameters.get("expected_patch_sha256") or patch_sha256
+            if actual != patch_sha256 or actual != expected:
+                return refused(f"patch SHA-256 mismatch: expected {expected}, got {actual}")
+            if len(patch) > MAX_PATCH_BYTES:
+                return refused("patch is larger than a manifest edit can be")
+            if not target_purls:
+                return refused("no target purl given: the resolved version cannot be checked")
+            paths = validate_patch(patch.decode("utf-8"), members.keys())
+        else:
+            paths = health_manifests(members)
+            if not paths:
+                return {**refused("no pom.xml, package.json or requirements file: nothing to build"),
+                        "status": "failure"}
         plan = plan_build(paths, members)
     except UnicodeDecodeError:
         return refused("patch is not UTF-8 text")
     except PatchRefused as exc:
         return refused(f"patch refused: {exc}")
 
-    input_tar = build_tar({**{f"src/{p}": (d, False) for p, d in members.items()},
-                           "patch.diff": (patch, False)})
+    inputs = {f"src/{p}": (d, False) for p, d in members.items()}
+    if mode == "verify":
+        inputs["patch.diff"] = (patch, False)
+    input_tar = build_tar(inputs)
     allow_proxy = EgressProxy(mode="allowlist")
     allow_port = allow_proxy.start()
     try:
@@ -651,15 +680,19 @@ def run_stage4_verify(run_id: str, source_sha256: str, patch_sha256: str, parame
             script=VERIFY_SCRIPT,
             input_tar=input_tar,
             env={
+                "GUARDIAN_MODE": mode,
                 "GUARDIAN_ECOSYSTEMS": " ".join(plan["ecosystems"]),
                 "GUARDIAN_MAVEN_DIR": plan["maven_dir"],
                 "GUARDIAN_MAVEN_PLUGIN": MAVEN_DEPENDENCY_PLUGIN,
                 "GUARDIAN_NPM_DIRS": " ".join(plan["npm_dirs"]),
                 "GUARDIAN_NPM_BUILD_DIRS": " ".join(plan["npm_build_dirs"]),
                 "GUARDIAN_NPM_TEST_DIRS": " ".join(plan["npm_test_dirs"]),
+                "GUARDIAN_NPM_START_DIRS": " ".join(plan["npm_start_dirs"]),
                 "GUARDIAN_PYPI_REQS": " ".join(plan["pypi_reqs"]),
                 "GUARDIAN_PYPI_TESTS": "1" if plan["tests_expected"].get("pypi") else "0",
                 "GUARDIAN_STEP_TIMEOUT": str(STEP_TIMEOUT_S),
+                "GUARDIAN_STARTUP_WINDOW": str(STARTUP_WINDOW_S),
+                "GUARDIAN_READY_PATTERN": READY_PATTERN,
             },
             egress=EgressConfig(allowlist_port=allow_port),
             timeout_s=VERIFY_TIMEOUT_S,
@@ -671,7 +704,7 @@ def run_stage4_verify(run_id: str, source_sha256: str, patch_sha256: str, parame
 
     out = sandbox_output_files(result.output_tar)
     steps = parse_steps(out.pop("steps.txt", b"").decode(errors="replace"))
-    facts = summarise(plan, steps, out, target_purls, result.timed_out)
+    facts = summarise(plan, steps, out, target_purls, result.timed_out, mode=mode)
 
     logs = {p: scrub(d.decode("utf-8", errors="replace"))[-MAX_LOG_BYTES:].encode("utf-8")
             for p, d in out.items() if p.startswith("logs/") and p.endswith(".log")}
@@ -679,20 +712,20 @@ def run_stage4_verify(run_id: str, source_sha256: str, patch_sha256: str, parame
         s["log_tail"] = tail(logs.get(f"logs/{name}.log", b"").decode("utf-8", errors="replace"), 1500)
 
     egress_log = allow_proxy.get_logs()
-    blocked = sorted({r["target_host"] for r in egress_log if not r["allowed"]})
     metrics = {
         "duration_ms": result.duration_ms,
         "proxy_requests": len(egress_log),
         "proxy_blocked": sum(1 for r in egress_log if not r["allowed"]),
-        "blocked_hosts": blocked,
+        "blocked_hosts": sorted({r["target_host"] for r in egress_log if not r["allowed"]}),
         "egress_domains_hit": sorted({r["target_host"] for r in egress_log if r["allowed"]}),
     }
     manifest = {
-        "schema": "guardian.verify-bundle/1",
+        "schema": "guardian.verify-bundle/2",
+        "mode": mode,
         "run_id": run_id,
         "source_sha256": source_sha256,
-        "patch_sha256": patch_sha256,
-        "patched_files": paths,
+        "patch_sha256": patch_sha256 if mode == "verify" else None,
+        "built_manifests": paths,
         "target_purls": target_purls,
         "plan": plan,
         "steps": steps,
@@ -705,18 +738,23 @@ def run_stage4_verify(run_id: str, source_sha256: str, patch_sha256: str, parame
         "tool_status": {"syft": "ok" if facts["sbom_generated"] else "fail"},
     }
     bundle_files = {p: (d, False) for p, d in out.items()
-                    if (p.startswith("resolved/") and p.endswith(".json")) or p.startswith(("tests/", "baseline/"))
+                    if (p.startswith("resolved/") and p.endswith(".json")) or p.startswith(("tests/", "startup/"))
                     or p == "sbom/syft.cdx.json"}
     bundle_files.update({p: (d, False) for p, d in logs.items()})
     bundle_files["manifest.json"] = (json.dumps(manifest, sort_keys=True, indent=1).encode(), False)
     bundle_sha256 = store.put(build_tar(bundle_files))
 
-    passed = (facts["build_success"] and facts["resolved_version_matches"] and facts["sbom_generated"]
-              and (facts["tests_success"] is not False or facts["tests_preexisting_failures"]))
+    if mode == "verify":
+        # facts only: whether failing tests or a failed start-up are new is decided by the Verification gate
+        # against the health check; here "success" means the patch applied, built and resolved the target
+        passed = facts["build_success"] and facts["resolved_version_matches"] is True and facts["sbom_generated"]
+    else:
+        passed = facts["build_success"]
     return {
         "status": "success" if passed else "failure",
+        "mode": mode,
         "bundle_sha256": bundle_sha256,
-        "patch_sha256": patch_sha256,
+        "patch_sha256": patch_sha256 if mode == "verify" else None,
         **facts,
         "steps": {k: {kk: vv for kk, vv in v.items() if kk != "log_tail"} for k, v in steps.items()},
         "stderr_tail": tail(scrub(result.stderr)),

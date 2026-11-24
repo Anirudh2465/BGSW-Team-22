@@ -118,6 +118,8 @@ export interface RunData {
   assists?: Record<string, AssistRecord>;
   decisions?: Record<string, { decision: "APPROVED" | "REJECTED"; user_id: string; patch_sha256: string; at?: string }>;
   gate_results: GateResult[];
+  repo_health?: Record<string, any> | null;
+  repo_health_sha256?: string | null;
   final_report?: {
     markdown_sha256?: string;
     sarif_sha256?: string;

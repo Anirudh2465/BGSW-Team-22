@@ -384,8 +384,10 @@ def _stage4_facts(resp, patch_sha: str) -> Dict[str, Any]:
         "build_success": d.get("build_success", False),
         "tests_found": d.get("tests_found", False),
         "tests_success": d.get("tests_success"),
-        "tests_preexisting_failures": d.get("tests_preexisting_failures", False),
         "tests": d.get("tests", {}),
+        "startup_ok": d.get("startup_ok"),
+        "startup": d.get("startup", {}),
+        "mode": d.get("mode"),
         "resolved_version_matches": d.get("resolved_version_matches", False),
         "resolved_checks": d.get("resolved_checks", []),
         "sbom_generated": d.get("sbom_generated", False),
@@ -395,6 +397,116 @@ def _stage4_facts(resp, patch_sha: str) -> Dict[str, Any]:
         "metrics": {k: resp.metrics.get(k) for k in ("duration_ms", "proxy_requests", "proxy_blocked",
                                                       "blocked_hosts", "egress_domains_hit") if k in resp.metrics},
     }
+
+
+# ---------------------------------------------------------------- repo health check
+def health_facts(state: GuardianState) -> Optional[Dict[str, Any]]:
+    """The run's health check (the standard checks on the untouched repo), from its audit entry."""
+    for entry in reversed(state.get("audit_log") or []):
+        if entry.get("stage") == "health" and isinstance(entry.get("health"), dict):
+            return entry["health"]
+    return None
+
+
+def run_health_check(state: GuardianState) -> Dict[str, Any]:
+    """Stage 4 in health mode: install, build, test, start the untouched repo. Never raises; an
+    infrastructure failure is recorded as status "error" (and blocks fixes until a health check succeeds)."""
+    run_id, source = state["run_id"], state["source_sha256"]
+    try:
+        _push(source)
+        resp = service_clients.run_launcher_stage(StageRunRequest(
+            run_id=run_id, stage="verify", commit_sha=state.get("commit_sha"), source_artifact_sha256=source,
+            parameters={"mode": "health"}))
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "error", "mode": "health", "error": f"launcher unreachable: {type(exc).__name__}: {exc}"[:400],
+                "build_success": None}
+    facts = _stage4_facts(resp, "")
+    facts.pop("patch_sha256", None)
+    facts.pop("requested_patch_sha256", None)
+    facts["mode"] = "health"
+    if resp.artifact_sha256:
+        try:
+            _pull(run_id, "health", resp.artifact_sha256, GZIP_TAR)
+        except Exception as exc:  # noqa: BLE001
+            facts.update({"status": "error", "error": f"health bundle not retrievable: {exc}"[:400]})
+    if resp.status == "error":
+        facts["build_success"] = None  # the checks could not run: unknown, not "broken"
+    return facts
+
+
+def health_summary(facts: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """What the Verification gate needs from the health check (attached to each verified remediation)."""
+    if not facts:
+        return None
+    return {k: facts.get(k) for k in ("status", "build_success", "tests_found", "tests_success", "tests",
+                                      "startup_ok", "startup", "bundle_sha256", "error")}
+
+
+def health_card(facts: Optional[Dict[str, Any]], run_id: str, commit_sha: str) -> Optional[Dict[str, Any]]:
+    """The health check in the dashboard card's shape (RepoHealthCard): pure reshaping, no new facts."""
+    if not facts:
+        return None
+    steps = facts.get("steps") or {}
+    tests = [t for t in (facts.get("tests") or {}).values() if isinstance(t, dict)]
+    failing = sorted({c for t in tests for c in t.get("failing") or []})
+    total = sum(int(t.get("tests") or 0) for t in tests)
+    failed = sum(int(t.get("failures") or 0) + int(t.get("errors") or 0) for t in tests)
+    skipped = sum(int(t.get("skipped") or 0) for t in tests)
+    install = [s for n, s in steps.items() if ".lock." in n or ".venv." in n or n == "maven.resolve.root"]
+    probe = {"attempted": False, "ready": False, "status": "skipped", "duration_ms": 0}
+    for st in (facts.get("startup") or {}).values():
+        if not isinstance(st, dict) or st.get("status") in ("not_applicable", "not_run", "unknown", None):
+            continue
+        ms = (steps.get(st.get("step") or "") or {}).get("duration_ms") or 0
+        if st.get("ok"):
+            probe = {"attempted": True, "ready": True, "status": "passed", "duration_ms": ms,
+                     "readiness_matched": "ready marker printed" if st.get("status") == "ready"
+                     else "still running after the start-up window" if st.get("status") == "alive" else "exited 0"}
+        else:
+            probe = {"attempted": True, "ready": False, "status": "failed", "duration_ms": ms,
+                     "crash_reason": f"exited with code {st.get('exit_code')}"}
+        break
+    else:
+        reasons = [st.get("reason") for st in (facts.get("startup") or {}).values() if isinstance(st, dict) and st.get("reason")]
+        if reasons:
+            probe["crash_reason"] = reasons[0]
+    if facts.get("status") == "error" or facts.get("build_success") is None:
+        status = "error"
+    elif facts.get("build_success") is False:
+        status = "failing"
+    elif facts.get("tests_success") is False or facts.get("startup_ok") is False:
+        status = "degraded"
+    else:
+        status = "healthy"
+    return {
+        "run_id": run_id, "commit_sha": commit_sha or "", "status": status,
+        "install_success": all(s.get("exit_code") == 0 for s in install) if install else bool(facts.get("build_success")),
+        "build_success": bool(facts.get("build_success")),
+        "tests_found": bool(facts.get("tests_found")), "tests_success": facts.get("tests_success"),
+        "test_catalog": {"total": total, "failed_count": failed, "skipped_count": skipped,
+                         "passed_count": max(total - failed - skipped, 0), "passed_tests": [],
+                         "failed_tests": [{"test_id": c, "classname": c.split("#")[0], "name": c.split("#")[-1]}
+                                          for c in failing]},
+        "startup_probe": probe,
+        "step_timings_ms": {n: int(s.get("duration_ms") or 0) for n, s in steps.items()},
+        "summary_text": facts.get("error"),
+        "bundle_sha256": facts.get("bundle_sha256"),
+    }
+
+
+def health_entry(state: GuardianState, facts: Dict[str, Any]) -> Dict[str, Any]:
+    """Audit-log delta for a health check (informational: it never stops the pipeline)."""
+    return _record(state, "health_node", None, {
+        "stage": "health",
+        "artifacts": {"bundle": facts["bundle_sha256"]} if facts.get("bundle_sha256") else {},
+        "health": facts,
+    })
+
+
+@guarded("health_node")
+def health_node(state: GuardianState) -> Dict[str, Any]:
+    """The standard repo checks, once per scan, before anything is changed: the reference for every fix."""
+    return health_entry(state, run_health_check(state))
 
 
 def _trim_rescan(r: Dict[str, Any]) -> Dict[str, Any]:

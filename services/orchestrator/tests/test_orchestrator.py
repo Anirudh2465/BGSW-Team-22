@@ -160,6 +160,11 @@ class FakeServices:
             assert req.parameters["network_mode"] == "none"
             return StageRunResponse(run_id=req.run_id, stage="scan", status="success",
                                     artifact_sha256=self.blob("bundle"), details={"network_isolated": True})
+        if req.stage == "verify" and req.parameters.get("mode") == "health":
+            return StageRunResponse(run_id=req.run_id, stage="verify", status="success",
+                                    artifact_sha256=self.blob("health"),
+                                    details={"mode": "health", "build_success": True, "tests_found": False,
+                                             "startup_ok": None})
         raise AssertionError(req.stage)
 
     def fetch_launcher_artifact(self, digest):
@@ -219,7 +224,9 @@ def test_front_half_brokers_artifacts_and_feeds_bundle_to_discover(fake):
     assert data["status"] == "awaiting_approval"  # paused with the draft fix: verification is on request
 
     stages = [c[1] for c in services.calls if c[0] == "stage"]
-    assert stages == ["clone", "resolve", "scan"]
+    assert stages == ["clone", "resolve", "scan", "verify"]   # verify = the repo health check (mode "health")
+    health = next(c[2] for c in services.calls if c[0] == "stage" and c[1] == "verify")
+    assert health == {"mode": "health"}
     resolve_params = next(c[2] for c in services.calls if c[0] == "stage" and c[1] == "resolve")
     assert resolve_params["observe_hooks"] is True  # from the check plan
 
@@ -280,7 +287,9 @@ def test_coverage_gate_retries_resolve_once_then_continues(fake):
     assert [g["attempt"] for g in coverage_gates] == [1, 2]
     assert coverage_gates[0]["action"] == "retry_resolve"
     assert coverage_gates[1]["action"] == "marked_skipped"
-    assert [c[1] for c in services.calls if c[0] == "stage"] == ["clone", "resolve", "scan", "resolve", "scan"]
+    # one health check, after the coverage retry settled (verify = stage 4 in "health" mode)
+    assert [c[1] for c in services.calls if c[0] == "stage"] == ["clone", "resolve", "scan", "resolve", "scan",
+                                                                 "verify"]
     assert "cross_check_gate" in gates(data)  # pipeline continued with npm marked skipped
     assert data["coverage"]["npm"] == "skipped"
 

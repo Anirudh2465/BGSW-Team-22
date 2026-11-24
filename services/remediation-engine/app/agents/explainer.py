@@ -8,140 +8,8 @@ from typing import Any, Dict, List, Optional
 from guardian_contracts.state import Finding
 
 
-# Curated catalog of high-profile or common vulnerabilities
-CURATED_VULNERABILITY_CATALOG: Dict[str, Dict[str, str]] = {
-    "CVE-2020-11023": {
-        "title": "Cross-Site Scripting (XSS) via jQuery.htmlPrefilter Regex Bypass",
-        "advisory": "CVE-2020-11023 / GHSA-jpcq-cgw6-v4j6",
-        "cwe": "CWE-79: Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')",
-        "root_cause": (
-            "In jQuery versions >= 1.2 and < 3.5.0, untrusted HTML passed to DOM manipulation methods "
-            "(such as .html(), .append(), .prepend(), .wrap(), and .after()) is pre-processed by the internal "
-            "jQuery.htmlPrefilter regex. This regex replaces self-closing tags (<tag/> -> <tag></tag>). "
-            "An attacker can craft self-closing HTML elements (such as <style/> or <option/> with embedded script vectors) "
-            "that safely bypass upstream HTML sanitizers (e.g. DOMPurify older profiles). When jQuery subsequently converts "
-            "the prefiltered markup into native innerHTML, the browser executes the injected script within the victim's "
-            "authenticated browser session, enabling DOM tampering, session hijacking, and CSRF token exfiltration."
-        ),
-        "remediation": (
-            "Upgrade 'pkg:npm/jquery' to version >= 3.5.0 (recommended: ^3.7.1). If immediate upgrade is blocked by "
-            "legacy plugins, apply the official jQuery 3.5.0 monkey-patch workaround by redefining "
-            "'jQuery.htmlPrefilter = function(html) { return html; }' before any DOM operations, and sanitize all "
-            "untrusted HTML using DOMPurify."
-        ),
-    },
-    "CVE-2020-11022": {
-        "title": "Cross-Site Scripting (XSS) in jQuery via Executed Scripts from Non-Script Tags",
-        "advisory": "CVE-2020-11022 / GHSA-2b5d-q349-f4st",
-        "cwe": "CWE-79: Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')",
-        "root_cause": (
-            "In jQuery < 3.5.0, passing HTML containing <style> tags to jQuery manipulation methods can lead to script "
-            "execution even when sanitizers strip script tags. The parser erroneously creates elements out of context, "
-            "permitting arbitrary JavaScript execution in victim browsers."
-        ),
-        "remediation": "Upgrade 'pkg:npm/jquery' to version >= 3.5.0 or override jQuery.htmlPrefilter.",
-    },
-    "CVE-2019-11358": {
-        "title": "Prototype Pollution via jQuery.extend()",
-        "advisory": "CVE-2019-11358 / GHSA-rmxg-73gg-4p99",
-        "cwe": "CWE-1321: Improperly Controlled Modification of Object Prototype Attributes ('Prototype Pollution')",
-        "root_cause": (
-            "jQuery prior to 3.4.0 mishandles deep recursive cloning in jQuery.extend(true, {}, ...). An attacker "
-            "supplying untrusted JSON containing '__proto__' object properties can pollute Object.prototype across the "
-            "entire browser application runtime, altering global property resolution and creating persistent client-side logic flaws."
-        ),
-        "remediation": "Upgrade 'pkg:npm/jquery' to version >= 3.4.0.",
-    },
-    "CVE-2015-9251": {
-        "title": "Cross-Site Scripting (XSS) via Cross-Domain jQuery.ajax() Responses",
-        "advisory": "CVE-2015-9251 / GHSA-j6w9-fv6q-3q52",
-        "cwe": "CWE-79: Cross-site Scripting",
-        "root_cause": (
-            "jQuery prior to 3.0.0 automatically evaluates JavaScript responses received from cross-domain requests "
-            "initiated via $.ajax() without verifying dataType. A remote malicious origin can deliver executable payloads "
-            "that execute automatically in the context of the requesting web application."
-        ),
-        "remediation": "Upgrade 'pkg:npm/jquery' to version >= 3.0.0 or explicitly specify dataType: 'json' on all $.ajax calls.",
-    },
-    "CVE-2018-1002204": {
-        "title": "Arbitrary File Overwrite via Directory Traversal ('Zip Slip')",
-        "advisory": "CVE-2018-1002204 / GHSA-jp3v-w3ch-5gf8",
-        "cwe": "CWE-22: Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
-        "root_cause": (
-            "The archive decompression routine in adm-zip prior to 0.4.9 fails to sanitize relative directory traversal "
-            "characters ('../' or '..\\') in archive entry filenames. When unzipping a crafted archive, files are written "
-            "outside the intended extraction directory. An attacker can overwrite executable binaries, cron jobs, or server "
-            "source files, achieving arbitrary remote code execution."
-        ),
-        "remediation": "Upgrade 'pkg:npm/adm-zip' to version >= 0.4.11 where canonical destination paths are strictly validated.",
-    },
-    "CVE-2019-10744": {
-        "title": "Prototype Pollution in Lodash defaultsDeep()",
-        "advisory": "CVE-2019-10744 / GHSA-p6cf-qh Cursor-lodash",
-        "cwe": "CWE-1321: Prototype Pollution",
-        "root_cause": (
-            "The defaultsDeep function in lodash versions < 4.17.12 allows modification of Object.prototype when merging "
-            "objects containing '__proto__' keys. In Node.js server runtimes, this allows unauthenticated remote attackers "
-            "to inject arbitrary object properties, bypass authentication logic, or trigger denial of service."
-        ),
-        "remediation": "Upgrade 'pkg:npm/lodash' to version >= 4.17.21. In addition, run Object.freeze(Object.prototype) at server initialization.",
-    },
-    "CVE-2018-16487": {
-        "title": "Prototype Pollution in Lodash merge() and mergeWith()",
-        "advisory": "CVE-2018-16487 / GHSA-jf85-cpcp-j695",
-        "cwe": "CWE-1321: Prototype Pollution",
-        "root_cause": (
-            "The merge and mergeWith utilities in lodash before 4.17.11 can be tricked into adding or modifying properties of "
-            "Object.prototype through constructor.prototype payloads."
-        ),
-        "remediation": "Upgrade 'pkg:npm/lodash' to version >= 4.17.21.",
-    },
-    "CVE-2017-16138": {
-        "title": "Regular Expression Denial of Service (ReDoS) in 'ms' Millisecond Parser",
-        "advisory": "CVE-2017-16138 / GHSA-w978-rmpf-qghg",
-        "cwe": "CWE-400: Uncontrolled Resource Consumption ('Resource Exhaustion')",
-        "root_cause": (
-            "The regular expression used in the 'ms' library to parse human-readable duration strings contains overlapping "
-            "repeating groups. Evaluating an input string containing long sequences of digits followed by whitespace causes "
-            "catastrophic polynomial backtracking in the Node.js V8 regex engine, freezing the event loop and causing denial of service."
-        ),
-        "remediation": "Upgrade 'pkg:npm/ms' to version >= 2.0.0 (or 0.7.2). Enforce string length bounds before invoking duration parsers.",
-    },
-    "CVE-2021-44228": {
-        "title": "Log4Shell Unauthenticated Remote Code Execution (RCE)",
-        "advisory": "CVE-2021-44228 / GHSA-jfh8-c2jp-5v3q",
-        "cwe": "CWE-502: Deserialization of Untrusted Data / CWE-917: Improper Neutralization of Special Elements used in an Expression Language",
-        "root_cause": (
-            "Apache Log4j2 (versions 2.0-beta9 through 2.14.1) allows unauthenticated remote code execution via JNDI message "
-            "lookup substitution. When user input containing '${jndi:ldap://...}' or '${jndi:rmi://...}' is logged, the core "
-            "formatting engine connects to an attacker-controlled directory service, downloads untrusted Java class bytecode, "
-            "and executes arbitrary code with host process privileges."
-        ),
-        "remediation": "Upgrade 'org.apache.logging.log4j:log4j-core' to version >= 2.17.1 where message lookup substitution is permanently disabled by default.",
-    },
-    "CVE-2017-1000427": {
-        "title": "Cross-Site Scripting (XSS) in Marked Markdown Parser",
-        "advisory": "CVE-2017-1000427 / GHSA-8h25-6r2f-ww7f",
-        "cwe": "CWE-79: Cross-site Scripting",
-        "root_cause": (
-            "The marked Markdown parser fails to properly sanitize javascript: URIs in link definitions when sanitize is disabled "
-            "or improperly configured, allowing injected links to execute JavaScript upon user click."
-        ),
-        "remediation": "Upgrade 'pkg:npm/marked' to version >= 0.3.9 and pipe all output through DOMPurify.",
-    },
-    "CVE-2016-10557": {
-        "title": "Arbitrary Code Execution via Template Injection in Dust.js",
-        "advisory": "CVE-2016-10557 / GHSA-qcr4-pq7p-j9vv",
-        "cwe": "CWE-94: Improper Control of Generation of Code ('Code Injection')",
-        "root_cause": (
-            "Dust.js template engine allows template helpers to compile and evaluate unsanitized strings, leading to arbitrary "
-            "JavaScript code execution in the Node.js server process when rendering attacker-controlled templates."
-        ),
-        "remediation": "Upgrade 'pkg:npm/dustjs-linkedin' to version >= 2.7.5.",
-    },
-}
-
-# Common CWE descriptions
+# No CVE-specific text is hard-coded here: every explanation is built from the advisory data the scanners
+# reported (summary, CWE, CVSS vector, fixed versions). CWE_TITLES below names weakness *types*, not CVEs.
 CWE_TITLES: Dict[str, str] = {
     "CWE-79": "Cross-Site Scripting (XSS)",
     "CWE-89": "SQL Injection",
@@ -255,34 +123,23 @@ def format_detailed_finding_explanation(
                     advisory_id = candidate
                     break
 
-    # Look up in curated catalog
-    matched_catalog = None
-    if advisory_id in CURATED_VULNERABILITY_CATALOG:
-        matched_catalog = CURATED_VULNERABILITY_CATALOG[advisory_id]
-    else:
-        for alias in aliases:
-            if alias in CURATED_VULNERABILITY_CATALOG:
-                matched_catalog = CURATED_VULNERABILITY_CATALOG[alias]
-                break
+    summary = (entry.get("summary") if entry else None) or ""
+    summary = summary if isinstance(summary, str) else ""
 
     pkg_name = purl.split("@")[0].replace("pkg:npm/", "").replace("pkg:maven/", "").replace("pkg:pypi/", "")
     pkg_version = purl.split("@")[1] if "@" in purl else ""
 
     if kind == "cve":
-        if matched_catalog:
-            issue_title = matched_catalog["title"]
-            cve_id = matched_catalog["advisory"]
-            root_cause = matched_catalog["root_cause"]
-            remediation = matched_catalog["remediation"]
-        else:
-            # Dynamic technical breakdown from intelligence metadata
+        if True:  # built from the advisory data only (no hard-coded CVE text)
             cwe_label = ""
             if cwes and isinstance(cwes, list):
                 cwe_first = cwes[0].upper()
                 cwe_label = CWE_TITLES.get(cwe_first, cwe_first)
 
             cat_label = weakness_cat or cwe_label or "Security Advisory"
-            issue_title = f"{cat_label} in {pkg_name}"
+            # the advisory's own title when the scanners reported one, else the weakness type
+            first = summary.split(". ", 1)[0].rstrip(".")
+            issue_title = first if 0 < len(first) <= 120 else f"{cat_label} in {pkg_name}"
 
             all_ids = [advisory_id] + [a for a in aliases if a != advisory_id]
             cve_id = " / ".join(filter(None, all_ids)) or "Published CVE / Upstream Advisory"
@@ -290,10 +147,12 @@ def format_detailed_finding_explanation(
             vector_summary = parse_cvss_vector_summary(cvss_vec)
             lowest_fix = fix_info.get("lowest_fixed_version") if isinstance(fix_info, dict) else None
 
+            cwe_names = [CWE_TITLES.get(c.upper(), c.upper()) for c in (cwes or []) if isinstance(c, str)][:3]
             root_cause = (
-                f"A verified vulnerability ({cve_id}) affects component '{pkg_name}' version '{pkg_version}'. "
-                f"Attack profile: {vector_summary}. Attackers can exploit this flaw in the application's runtime "
-                f"or dependency chain to compromise system confidentiality, integrity, or service availability."
+                (f"{summary} " if summary else "")
+                + f"The vulnerability ({cve_id}) affects '{pkg_name}' version '{pkg_version}'"
+                + (f"; weakness: {', '.join(cwe_names)}" if cwe_names else "")
+                + f". Attack profile: {vector_summary}."
             )
 
             if lowest_fix:

@@ -92,6 +92,7 @@ def enrichment_artifact(sbom_sha: str, feeds: Dict[str, Any], vulns: List[Dict[s
                 "scope": v.get("scope"), "direct": v.get("direct", False), "blast_radius": v.get("blast_radius", 0),
                 "cwes": v.get("cwes", []), "weakness_category": v.get("weakness_category"), "fix": v.get("fix", {}),
                 "base_explanation": v.get("explanation"),
+                "summary": v.get("summary") or "",
             }
             for v in vulns
         },

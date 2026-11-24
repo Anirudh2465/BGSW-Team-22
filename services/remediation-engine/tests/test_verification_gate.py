@@ -33,7 +33,9 @@ PATCH = "a" * 64
 def stage4(**kw):
     base = {"status": "success", "patch_sha256": PATCH, "bundle_sha256": "b" * 64, "patch_applied": True,
             "build_success": True, "tests_found": True, "tests_success": True, "resolved_version_matches": True,
-            "resolved_checks": [{"purl": CANDIDATES[0], "matches": True}]}
+            "resolved_checks": [{"purl": CANDIDATES[0], "matches": True}],
+            "tests": {"maven": {"found": True, "success": True, "failing": [], "compared_by": "test_case"}},
+            "startup_ok": True, "startup": {"maven": {"status": "ready", "ok": True}}}
     return {**base, **kw}
 
 
@@ -44,8 +46,24 @@ def rescan(**kw):
     return {**base, **kw}
 
 
-def rem(s4=None, rs=None, retry=0, **kw):
+def health(**kw):
+    """The health check of the untouched repo: builds, its tests pass, it starts."""
+    base = {"status": "success", "build_success": True, "tests_found": True, "tests_success": True,
+            "tests": {"maven": {"found": True, "success": True, "failing": [], "compared_by": "test_case"}},
+            "startup_ok": True, "startup": {"maven": {"status": "ready", "ok": True}}, "bundle_sha256": "h" * 64}
+    return {**base, **kw}
+
+
+def failing_tests(*cases, key="maven"):
+    return {key: {"found": True, "success": False, "failing": list(cases), "compared_by": "test_case"}}
+
+
+def rem(s4=None, rs=None, retry=0, hc="default", **kw):
     validation = {"remediation": {"package": "log4j-core", "reason": None}, "selection": {"chosen": 0}}
+    if hc == "default":
+        hc = health()
+    if hc is not None:
+        validation["health"] = hc
     if s4 is not None:
         validation["stage4"] = s4
     if rs is not None:
@@ -81,16 +99,51 @@ def test_no_tests_verifies_only_with_warning():
     assert r.validation["verification"]["warning"] == NO_TESTS_WARNING
 
 
-def test_preexisting_test_failures_verify_only_with_warning():
-    r = run(rem(stage4(tests_success=False, tests_preexisting_failures=True), rescan())).verified_remediations[0]
-    assert r.state == "verified" and r.validation["warning"] == PREEXISTING_WARNING
+def test_failures_that_the_health_check_also_had_verify_only_with_warning():
+    pre = failing_tests("AppTest#contextLoads")
+    r = run(rem(stage4(tests_success=False, tests=pre), rescan(),
+                hc=health(tests_success=False, tests=pre))).verified_remediations[0]
+    assert r.state == "verified" and PREEXISTING_WARNING in r.validation["warning"]
     names = [c["name"] for c in r.validation["verification"]["checks"]]
     assert "tests_no_new_failures" in names and "tests_passed" not in names
 
 
-def test_new_test_failures_are_still_a_failure():
-    r = run(rem(stage4(tests_success=False, tests_preexisting_failures=False), rescan())).verified_remediations[0]
+def test_a_test_failing_only_after_the_patch_is_a_failure():
+    r = run(rem(stage4(tests_success=False, tests=failing_tests("AppTest#contextLoads", "AppTest#yaml")), rescan(),
+                hc=health(tests_success=False, tests=failing_tests("AppTest#contextLoads")))).verified_remediations[0]
     assert r.state == "draft" and "tests_passed" in failed(r)
+    assert r.validation["verification"]["new_test_failures"] == ["maven: AppTest#yaml"]
+
+
+def test_npm_failures_are_compared_by_exit_code():
+    npm = {"npm:.": {"found": True, "success": False, "failing": [], "compared_by": "exit_code"}}
+    ok = run(rem(stage4(tests_success=False, tests=npm), rescan(), hc=health(tests_success=False, tests=npm)))
+    assert ok.verified_remediations[0].state == "verified"
+    broke = run(rem(stage4(tests_success=False, tests=npm), rescan(), hc=health()))
+    assert broke.verified_remediations[0].state == "draft"
+
+
+def test_the_app_must_still_start_if_it_started_before():
+    r = run(rem(stage4(startup_ok=False, startup={"maven": {"status": "exited", "exit_code": 1, "ok": False}}),
+                rescan())).verified_remediations[0]
+    assert r.state == "draft" and "app_still_starts" in failed(r)
+
+
+def test_an_app_that_never_started_is_only_a_warning():
+    r = run(rem(stage4(startup_ok=False), rescan(), hc=health(startup_ok=False))).verified_remediations[0]
+    assert r.state == "verified" and "does not start without the patch" in r.validation["warning"]
+    na = run(rem(stage4(startup_ok=None), rescan(), hc=health(startup_ok=None))).verified_remediations[0]
+    assert na.state == "verified"
+
+
+@pytest.mark.parametrize("hc,why", [
+    (None, "no health check"),
+    (health(build_success=False), "does not build"),
+    (health(status="error", build_success=None, error="launcher unreachable"), "could not run"),
+])
+def test_without_a_usable_health_check_a_fix_cannot_be_verified(hc, why):
+    r = run(rem(stage4(), rescan(), hc=hc)).verified_remediations[0]
+    assert r.state == "escalated" and why in r.validation["verification"]["reason"]
 
 
 @pytest.mark.parametrize("s4,rs,check", [

@@ -8,9 +8,8 @@ SERVICE_DIR = Path(__file__).resolve().parent.parent
 REPO_ROOT = SERVICE_DIR.parent.parent
 
 sys.path = [p for p in sys.path if "routing-service" not in p]
-for m in list(sys.modules.keys()):
-    if m == "app" or m.startswith("app."):
-        del sys.modules[m]
+# No purge of `app.*`: this service's other test modules already imported `app`; re-importing it here would swap
+# module objects out from under their fixtures (test_remediation_engine then fails only in the full run).
 
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))

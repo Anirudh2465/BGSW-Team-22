@@ -273,6 +273,8 @@ def get_run(run_id: str):
         "policy_verdicts": state["policy_verdicts"],
         "remediations": state["remediations"],
         "approvals": state["approvals"],
+        "health": nodes.health_facts(state),
+        "repo_health": nodes.health_card(nodes.health_facts(state), run_id, state.get("commit_sha", "")),
         "pending_approvals": meta.get("pending_approvals", []),
         "awaiting_verification": meta.get("awaiting_verification", []),
         "verifying": meta.get("verifying"),
@@ -797,9 +799,18 @@ def _verify_worker(run_id: str, patch: str, group: List[str]) -> None:
 
     def step(on_update, on_state):
         state = RUNS_DB[run_id]
+        extra_audit = []
+        health = nodes.health_facts(state)
+        if health is None or health.get("status") == "error":
+            # a run scanned before health checks existed (or whose check could not run): do it now, once
+            health = nodes.run_health_check(state)
+            h_delta = nodes.health_entry(state, health)
+            extra_audit = h_delta["audit_log"]
+            on_update("health_check", h_delta, state)
         rems = [state["remediations"][f] for f in group]
         stage4, rescan = nodes.verify_patch(state, patch, rems)
-        attached = [r.model_copy(update={"validation": {**(r.validation or {}), "stage4": stage4, "rescan": rescan}})
+        attached = [r.model_copy(update={"validation": {**(r.validation or {}), "stage4": stage4, "rescan": rescan,
+                                                        "health": nodes.health_summary(health)}})
                     for r in rems]
         resp = service_clients.call_verify(VerifyRequest(run_id=run_id, remediations=attached,
                                                          source_artifact_sha256=state["source_sha256"]))
@@ -822,8 +833,8 @@ def _verify_worker(run_id: str, patch: str, group: List[str]) -> None:
         arts = {k: v for k, v in {"verify_bundle_0": stage4.get("bundle_sha256"),
                                   "rescan_0": rescan.get("result_sha256")}.items() if v}
         delta = {"remediations": out, "gate_results": [gate],
-                 "audit_log": [{"node": "verify_node", "gate": gate, "stage": "verify", "artifacts": arts,
-                                "entry_hash": entry["entry_hash"]}]}
+                 "audit_log": extra_audit + [{"node": "verify_node", "gate": gate, "stage": "verify", "artifacts": arts,
+                                              "entry_hash": entry["entry_hash"]}]}
         graph_runner.inject(run_id, delta, as_node="verify")
         on_update("verify", delta, state)
         return graph_runner.proceed(run_id, on_update=on_update, on_state=on_state)

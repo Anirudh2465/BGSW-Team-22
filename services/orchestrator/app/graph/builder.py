@@ -38,6 +38,7 @@ from .nodes import (
     confirm_source_node,
     detect_node,
     discover_node,
+    health_node,
     policy_node,
     prioritize_node,
     remediate_node,
@@ -65,6 +66,7 @@ def build_graph(checkpointer=None):
     g.add_node("resolve", resolve_node)
     g.add_node("scan", scan_node)
     g.add_node("discover", discover_node)
+    g.add_node("health_check", health_node)
     g.add_node("detect", detect_node)
     g.add_node("prioritize", prioritize_node)
     g.add_node("policy", policy_node)
@@ -78,7 +80,10 @@ def build_graph(checkpointer=None):
     g.add_conditional_edges("cartographer", route_after_cartographer, {"resolve": "resolve", "stop": END})
     g.add_edge("resolve", "scan")
     g.add_edge("scan", "discover")
-    g.add_conditional_edges("discover", route_after_discover, {"detect": "detect", "retry": "resolve", "stop": END})
+    g.add_conditional_edges("discover", route_after_discover,
+                            {"detect": "health_check", "retry": "resolve", "stop": END})
+    # repo health check: the standard checks on the untouched repo, once per scan (informational)
+    g.add_edge("health_check", "detect")
     g.add_edge("detect", "prioritize")
     g.add_edge("prioritize", "policy")
     g.add_edge("policy", "remediate")

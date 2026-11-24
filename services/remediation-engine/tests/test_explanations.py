@@ -301,3 +301,26 @@ def test_live_gemini_explanation_passes_grounding():
         print(f"{f.id}: {line}")
     assert stats["grounded"] >= 1, stats  # real Gemini output passes the code grounding check
     assert res.gate_passed is True
+
+
+def test_no_cve_specific_text_is_hard_coded_in_the_explainer():
+    from app.agents import explainer
+    source = Path(explainer.__file__).read_text(encoding="utf-8")
+    assert "CURATED_VULNERABILITY_CATALOG" not in source
+    import re as _re
+    assert not _re.findall(r'"CVE-\d{4}-\d+"', source)
+
+
+def test_cve_explanation_is_built_from_the_advisory_data():
+    f = Finding(id="x", kind="cve", purl="pkg:npm/lodash@4.17.15", status="confirmed", score=70,
+                evidence=[Evidence(id="grype:GHSA-p6mc-m468-83gw", tool="grype", artifact_sha256="g")])
+    entry = {"advisory_id": "CVE-2020-8203", "aliases": ["GHSA-p6mc-m468-83gw"], "cvss_score": 7.4,
+             "cvss_vector": "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:N/I:H/A:H", "cwes": ["CWE-1321"],
+             "fix": {"lowest_fixed_version": "4.17.19"},
+             "summary": "Prototype Pollution in lodash. The zipObjectDeep function can pollute the prototype."}
+    text = format_detailed_finding_explanation(f, entry, 70, None)
+    assert text.startswith("**Prototype Pollution in lodash**")            # title = the advisory's own summary
+    assert "zipObjectDeep function can pollute" in text                       # root cause quotes the advisory
+    assert "CVE-2020-8203" in text and "4.17.19" in text
+    no_summary = format_detailed_finding_explanation(f, {**entry, "summary": ""}, 70, None)
+    assert "in lodash" in no_summary.split("\n", 1)[0]                      # falls back to weakness type + package

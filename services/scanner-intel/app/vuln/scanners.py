@@ -47,6 +47,7 @@ class ToolMatch:
     tool_score: Optional[float] = None
     fixed_versions: List[str] = field(default_factory=list)
     cwes: List[str] = field(default_factory=list)
+    summary: str = ""   # the advisory's own one-line description (OSV summary / Grype description)
 
 
 @dataclass
@@ -60,6 +61,14 @@ class ToolRun:
     error: Optional[str] = None
     exit_code: Optional[int] = None
     source: str = "binary"            # binary | recorded
+
+
+def one_line(text: Any, limit: int = 300) -> str:
+    """An advisory description as one plain line (whitespace collapsed, markdown markers dropped, capped)."""
+    if not isinstance(text, str):
+        return ""
+    t = re.sub(r"[`*_#>\[\]]", "", " ".join(text.split()))
+    return t if len(t) <= limit else t[:limit - 1].rstrip() + "…"
 
 
 def canonical(obj: Any) -> bytes:
@@ -123,7 +132,9 @@ def parse_grype(data: Dict[str, Any]) -> List[ToolMatch]:
         fix = v.get("fix") or {}
         fixed = list(fix.get("versions") or []) if fix.get("state") == "fixed" else []
         cwes = sorted({c.get("cwe") for c in (v.get("cwes") or []) if isinstance(c, dict) and c.get("cwe")})
+        summary = v.get("description") or next((r.get("description") for r in related if r.get("description")), "")
         out.append(ToolMatch(tool="grype", purl=art["purl"], advisory_id=v["id"], aliases=frozenset(aliases),
+                             summary=one_line(summary),
                              cvss=cvss, tool_score=max(scores) if scores else None, fixed_versions=fixed, cwes=cwes))
     return out
 
@@ -197,7 +208,9 @@ def parse_osv(data: Dict[str, Any]) -> List[ToolMatch]:
                 except (TypeError, ValueError):
                     tool_score = None
                 cwes = sorted(set((v.get("database_specific") or {}).get("cwe_ids") or []))
+                summary = v.get("summary") or (v.get("details") or "").strip().split("\n", 1)[0]
                 out.append(ToolMatch(tool="osv-scanner", purl=purl, advisory_id=vid, aliases=frozenset(aliases), cvss=cvss,
+                                     summary=one_line(summary),
                                      tool_score=tool_score, fixed_versions=_osv_fixed(v, pkg), cwes=cwes))
     return out
 

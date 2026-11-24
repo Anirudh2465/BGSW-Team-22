@@ -6,6 +6,7 @@ import { ArrowRight, ExternalLink, FileCode2, ShieldAlert, Waypoints } from "luc
 import { useRun } from "../../../lib/run-context";
 import { Badge, Card, CardHeader, EmptyState, ScorePill, Stat } from "../../../components/ui";
 import { PipelineSteps, latestGates } from "../../../components/PipelineSteps";
+import { RepoHealthCard, type RepoHealthData } from "../../../components/RepoHealthCard";
 import { parsePurl } from "../../../lib/utils";
 
 export default function OverviewPage() {
@@ -37,6 +38,8 @@ export default function OverviewPage() {
             hint={m.single_source_components != null ? `${m.single_source_components} single-source` : undefined}
           />
         </div>
+
+        <RepoHealthCard health={run.repo_health as RepoHealthData | undefined} />
 
         <Card className="overflow-hidden">
           <div className="flex flex-col gap-4 p-5 sm:flex-row sm:items-center sm:justify-between">

@@ -129,7 +129,24 @@ export function VerificationChecks({ runId, findingId, s4, rs, ver, target }: { 
       <ul className="space-y-1.5">
         <Check ok={s4?.status ? s4.patch_applied : null} label="Patch applied to a clean checkout" detail={s4?.status === "error" ? s4.error : undefined} />
         <Check ok={ran ? s4.build_success : null} label="Build" detail={s4?.build_success === false ? s4.error : undefined} />
-        <Check ok={tests.ok} label={tests.label} detail={tests.detail} />
+        <Check
+          ok={ver?.new_test_failures?.length ? false : tests.ok}
+          label={ver?.new_test_failures?.length ? "Tests: the patch broke some" : tests.label}
+          detail={ver?.new_test_failures?.length ? `new failures vs the health check: ${(ver.new_test_failures as string[]).slice(0, 5).join(", ")}` : tests.detail}
+        />
+        <Check
+          ok={!ran ? null : ver?.health_starts === true ? s4.startup_ok === true : ver?.health_starts === false ? null : s4.startup_ok ?? null}
+          label="App still starts (60 s start-up check)"
+          detail={
+            ver?.health_starts === false
+              ? "it does not start without the patch either (health check)"
+              : s4?.startup_ok === false
+                ? `started before the patch, not after: ${Object.values((s4.startup ?? {}) as Dict).map((x: any) => x.status + (x.exit_code != null ? ` ${x.exit_code}` : "")).join(", ")}`
+                : s4?.startup_ok == null && ran
+                  ? "not applicable (no runnable artifact or start command)"
+                  : undefined
+          }
+        />
         <Check
           ok={ran && s4.build_success ? s4.resolved_version_matches : null}
           label={`Resolves ${target ? parsePurl(target).version : "the target"}`}

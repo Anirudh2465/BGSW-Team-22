@@ -70,10 +70,16 @@ class Backend:
     """Launcher + scanner-intel + remediation-engine, as seen through the orchestrator's client methods."""
 
     def __init__(self, verify_outcomes=(True,), tests_found=True, launcher_down=False, rescan_down=False,
-                 new_high_after_patch=False, assist=None):
+                 new_high_after_patch=False, assist=None, health=None, patched=None):
         self.outcomes = list(verify_outcomes)     # one per stage-4 call: build/tests pass?
         self.tests_found, self.launcher_down, self.rescan_down = tests_found, launcher_down, rescan_down
         self.new_high_after_patch, self.assist = new_high_after_patch, assist
+        # health check facts (the untouched repo) and extra facts for the patched run, both configurable
+        self.health = {"build_success": True, "tests_found": tests_found, "tests_success": True if tests_found else None,
+                       "tests": {"maven": {"found": tests_found, "success": True if tests_found else None,
+                                           "failing": [], "compared_by": "test_case"}},
+                       "startup_ok": True, "startup": {"maven": {"status": "ready", "ok": True}}, **(health or {})}
+        self.patched = patched or {}
         self.launcher, self.calls, self.reports, self.prs = {}, [], [], {}
 
     def blob(self, label: str) -> str:
@@ -94,6 +100,12 @@ class Backend:
                                     artifact_sha256=self.blob(req.stage), logs_artifact_sha256=self.blob("sink"),
                                     details={"network_isolated": True})
         assert req.stage == "verify"
+        if req.parameters.get("mode") == "health":
+            self.calls.append(("health",))
+            return StageRunResponse(run_id=req.run_id, stage="verify",
+                                    status="success" if self.health["build_success"] else "failure",
+                                    artifact_sha256=self.blob("health-bundle"), metrics={"duration_ms": 30000},
+                                    details={"mode": "health", **self.health})
         if self.launcher_down:
             raise ServiceError("http://launcher:8001/stages/run unreachable: connection refused")
         assert req.parameters["expected_patch_sha256"] == req.patch_artifact_sha256  # inputs by hash only
@@ -102,9 +114,14 @@ class Backend:
         return StageRunResponse(
             run_id=req.run_id, stage="verify", status="success" if ok else "failure",
             artifact_sha256=self.blob("verify-bundle"), metrics={"duration_ms": 41000, "blocked_hosts": []},
-            details={"patch_sha256": req.patch_artifact_sha256, "patch_applied": True, "build_success": ok,
-                     "tests_found": self.tests_found, "tests_success": (ok if self.tests_found else None),
-                     "resolved_version_matches": ok, "error": None if ok else "build failed: maven.build.root"})
+            details={"mode": "verify", "patch_sha256": req.patch_artifact_sha256, "patch_applied": True,
+                     "build_success": ok, "tests_found": self.tests_found,
+                     "tests_success": (ok if self.tests_found else None),
+                     "tests": {"maven": {"found": self.tests_found, "success": ok if self.tests_found else None,
+                                         "failing": [] if ok else ["AppTest#x"], "compared_by": "test_case"}},
+                     "startup_ok": True, "startup": {"maven": {"status": "ready", "ok": True}},
+                     "resolved_version_matches": ok, "error": None if ok else "build failed: maven.build.root",
+                     **self.patched})
 
     def fetch_launcher_artifact(self, digest):
         return self.launcher[digest]
@@ -263,7 +280,8 @@ def verify_click(run_id, fid):
 
 
 def stage4_calls(b):
-    return [c for c in b.calls if c[:2] == ("stage", "verify")]
+    """Verify-mode stage-4 runs (the once-per-scan health check is counted separately)."""
+    return [c for c in b.calls if c[:2] == ("stage", "verify") and c[3].get("mode") != "health"]
 
 
 def test_nothing_is_verified_without_a_click(backend):
@@ -594,3 +612,25 @@ def test_postgres_checkpointer_round_trip(backend):
     final, interrupts = fresh.resume(state["run_id"], {"__finish__": True, "__user__": "u"})
     assert interrupts == [] and final["final_report"]
     assert {a.decision for a in final["approvals"].values()} == {"PENDING"}
+
+
+def test_health_check_runs_once_per_scan_and_feeds_the_dashboard_card(backend):
+    b = backend(tests_found=True)
+    run_id, run = start()
+    assert [c for c in b.calls if c == ("health",)] == [("health",)]          # once, automatically, at scan time
+    card = run["repo_health"]
+    assert card["status"] == "healthy" and card["build_success"] is True
+    assert card["startup_probe"]["status"] == "passed" and card["startup_probe"]["ready"] is True
+    assert run["health"]["mode"] == "health"
+    verify_click(run_id, FINDINGS[0])                                           # reuses it: no second health check
+    assert [c for c in b.calls if c == ("health",)] == [("health",)]
+    r = client.get(f"/runs/{run_id}").json()["remediations"][FINDINGS[0]]
+    assert r["validation"]["health"]["build_success"] is True
+
+
+def test_a_repo_that_does_not_build_blocks_its_fixes_in_the_card_too(backend):
+    backend(health={"build_success": False, "startup_ok": None,
+                    "startup": {"maven": {"status": "not_applicable", "ok": None, "reason": "the build failed"}}})
+    _, run = start()
+    assert run["repo_health"]["status"] == "failing"
+    assert run["repo_health"]["startup_probe"]["crash_reason"] == "the build failed"
