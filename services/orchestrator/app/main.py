@@ -35,9 +35,9 @@ app = FastAPI(title="Supply Chain Guardian - Orchestrator Gateway", version="0.2
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.getenv("CORS_ORIGINS", "http://localhost:3000").split(","),
-    allow_methods=["GET", "POST"],
-    expose_headers=["X-Artifact-SHA256", "Content-Disposition"],
+    allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Artifact-SHA256", "X-Report-SHA256", "Content-Disposition"],
 )
 
 # Live view of run state (GuardianState) and run metadata (status, events, pending approvals). Graph state
@@ -410,8 +410,12 @@ def generate_run_report(run_id: str, req: GenerateReportRequest):
     content_bytes = content_text.encode("utf-8")
 
     # Store in artifact store
+    media_type = res_data.get("content_type") or "text/plain"
     if content_bytes and res_data.get("artifact_sha256"):
-        artifact_store.put(res_data["artifact_sha256"], content_bytes)
+        try:
+            artifact_store.put_verified(res_data["artifact_sha256"], run_id, "reporting", media_type, content_bytes)
+        except Exception as exc:
+            logger.warning("Could not store custom report to artifact store: %s", exc)
 
     # Append event to audit chain if available
     try:
