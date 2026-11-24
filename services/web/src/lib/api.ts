@@ -430,7 +430,9 @@ export interface PreviewInfo {
   error?: string | null;
   started_at?: number;
   expires_at?: number;
-  commit_sha?: string;
+  commit_sha?: string | null;
+  source?: "pushed" | "local_patch";
+  push_error?: string | null;
   database?: { kind: string; database: string; user: string } | null;
   log?: string;
 }

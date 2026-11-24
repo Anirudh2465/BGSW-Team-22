@@ -29,8 +29,8 @@ function Slot({ run, target, info, busy, onStart, onStop }: {
   const [showLog, setShowLog] = useState(false);
   const status = info?.status ?? "not started";
   const active = ACTIVE.includes(status);
-  const pushed = Object.values(run.confirmations ?? {}).some((c) => c.pull_request?.commit_sha);
-  const canStart = !active && (target === "original" ? !!run.source_sha256 : pushed);
+  const fixReady = Object.values(run.confirmations ?? {}).some((c) => c.pull_request?.commit_sha || c.status === "passed");
+  const canStart = !active && (target === "original" ? !!run.source_sha256 : fixReady);
   const left = info?.expires_at ? Math.max(0, Math.round((info.expires_at * 1000 - Date.now()) / 60000)) : null;
   return (
     <div className="flex min-w-0 flex-1 flex-col rounded-lg p-4 ring-1 ring-inset ring-white/10">
@@ -38,8 +38,17 @@ function Slot({ run, target, info, busy, onStart, onStop }: {
         <div className="min-w-0">
           <div className="text-sm font-semibold text-ink">{target === "original" ? "Original app" : "Fixed app"}</div>
           <div className="truncate font-mono text-[11px] text-ink-muted">
-            {target === "original" ? `scanned commit ${(run.commit_sha || "").slice(0, 10)}` : info?.commit_sha ? `pushed commit ${info.commit_sha.slice(0, 10)}` : "after a fix is pushed to the fork"}
+            {target === "original"
+              ? `scanned commit ${(run.commit_sha || "").slice(0, 10)}`
+              : info?.commit_sha
+                ? `pushed commit ${info.commit_sha.slice(0, 10)}`
+                : info?.source === "local_patch"
+                  ? "patched copy (not pushed to the fork)"
+                  : "after a fix is accepted"}
           </div>
+          {target === "fixed" && info?.source === "local_patch" && info.push_error && (
+            <div className="truncate text-[11px] text-amber-300" title={info.push_error}>push failed: {info.push_error}</div>
+          )}
         </div>
         <Badge tone={TONE[status] ?? "neutral"}>
           {active && status !== "running" && <Loader2 className="h-3 w-3 animate-spin" />}
@@ -59,7 +68,7 @@ function Slot({ run, target, info, busy, onStart, onStop }: {
             <Square className="h-3.5 w-3.5" /> Stop
           </Button>
         ) : (
-          <Button variant="primary" size="sm" disabled={busy || !canStart} onClick={onStart} title={!canStart && target === "fixed" ? "Accept a verified fix first: it is pushed to your fork, then this runs it" : "Build and run the app in the sandbox"}>
+          <Button variant="primary" size="sm" disabled={busy || !canStart} onClick={onStart} title={!canStart && target === "fixed" ? "Accept a verified fix first: it runs the pushed commit, or the patched copy if the push failed" : "Build and run the app in the sandbox"}>
             {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />} {status === "not started" ? "Run app" : "Run again"}
           </Button>
         )}
@@ -126,8 +135,8 @@ export function LiveAppPanel({ run }: { run: RunData }) {
       <div className="p-5">
         <h3 className="text-sm font-semibold text-ink">Live app</h3>
         <p className="mt-0.5 text-xs text-ink-muted">
-          Build and run the repo in the sandbox and open it in your browser (localhost only). After an approved fix is pushed to your fork, the fixed
-          commit is cloned and started automatically so you can check the app still works.
+          Build and run the repo in the sandbox and open it in your browser (localhost only). After a fix is accepted, the fixed app starts
+          automatically: the commit pushed to your fork, or the patched copy if the push failed, so you can check the app still works.
         </p>
         {error && <p className="mt-2 text-xs text-rose-300">{error}</p>}
         <div className="mt-4 flex flex-col gap-3 md:flex-row">

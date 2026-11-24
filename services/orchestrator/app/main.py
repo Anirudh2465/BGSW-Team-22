@@ -752,13 +752,17 @@ def _confirm_worker(child_id: str, parent_id: str, patch: str) -> None:
     if resume_with is not None:
         _start(_resume_worker, parent_id, resume_with)
     pushed = (conf.get("pull_request") or {})
-    if passed and pushed.get("status") in ("pushed", "already_pushed") and pushed.get("commit_sha"):
-        # the fix is on the fork now: clone that exact commit and run it, to show the app still works
+    if passed:
+        # run the fixed app to show it still works: the pushed fork commit, or, when the push failed,
+        # the patched copy the confirmation run just scanned
         try:
-            _start_fixed_preview(parent_id, pushed["commit_sha"])
+            if pushed.get("status") in ("pushed", "already_pushed") and pushed.get("commit_sha"):
+                _start_fixed_preview(parent_id, pushed["commit_sha"])
+            else:
+                _start_patched_preview(parent_id, conf)
         except Exception as exc:  # noqa: BLE001 - shown on the dashboard
             RUN_META[parent_id].setdefault("previews", {})["fixed"] = {"status": "error", "error": str(exc)[:300],
-                                                                     "commit_sha": pushed["commit_sha"]}
+                                                                     "commit_sha": pushed.get("commit_sha")}
             _persist(parent_id)
 
 
@@ -778,7 +782,24 @@ def _start_fixed_preview(run_id: str, commit_sha: str) -> Dict[str, Any]:
     if resp.status != "success" or not resp.artifact_sha256:
         raise ServiceError(f"could not clone the fixed commit: {resp.details.get('error') or resp.status}")
     info = service_clients.start_preview(resp.artifact_sha256, f"fixed {commit_sha[:8]}")
-    meta["previews"]["fixed"] = {**info, "commit_sha": commit_sha, "source_sha256": resp.artifact_sha256}
+    meta["previews"]["fixed"] = {**info, "commit_sha": commit_sha, "source_sha256": resp.artifact_sha256,
+                                 "source": "pushed"}
+    _persist(run_id)
+    return meta["previews"]["fixed"]
+
+
+def _start_patched_preview(run_id: str, conf: Dict[str, Any]) -> Dict[str, Any]:
+    """The push did not happen: run the patched copy (scanned source + verified patch) the confirmation passed on."""
+    meta = RUN_META[run_id]
+    sha = conf.get("patched_source_sha256")
+    if not sha:
+        raise ServiceError("this confirmation has no patched source")
+    push = conf.get("pull_request") or {}
+    nodes._push(sha)
+    info = service_clients.start_preview(sha, "fixed (local patch)")
+    meta.setdefault("previews", {})["fixed"] = {
+        **info, "commit_sha": None, "source_sha256": sha, "source": "local_patch",
+        "push_error": push.get("reason") or push.get("error") or (f"push {push['status']}" if push.get("status") else None)}
     _persist(run_id)
     return meta["previews"]["fixed"]
 
@@ -795,11 +816,16 @@ def start_run_preview(run_id: str, req: PreviewStartRequest):
         return current
     try:
         if req.target == "fixed":
-            pushed = [c.get("pull_request") or {} for c in (meta.get("confirmations") or {}).values()]
+            confs = list((meta.get("confirmations") or {}).values())
+            pushed = [c.get("pull_request") or {} for c in confs]
             commit = next((p.get("commit_sha") for p in reversed(pushed) if p.get("commit_sha")), None)
-            if not commit:
-                raise HTTPException(status_code=409, detail="no fix has been pushed to the fork yet")
-            return _start_fixed_preview(run_id, commit)
+            if commit:
+                return _start_fixed_preview(run_id, commit)
+            # nothing reached the fork: run the newest patched copy whose confirmation passed
+            passed_conf = next((c for c in reversed(confs) if c.get("status") == "passed"), None)
+            if not passed_conf:
+                raise HTTPException(status_code=409, detail="accept a verified fix first")
+            return _start_patched_preview(run_id, passed_conf)
         if not state.get("source_sha256"):
             raise HTTPException(status_code=409, detail="the repo has not been cloned yet")
         nodes._push(state["source_sha256"])
