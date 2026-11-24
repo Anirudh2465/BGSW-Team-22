@@ -1,4 +1,5 @@
 import hashlib
+import re
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from jinja2 import Environment, FileSystemLoader
@@ -12,6 +13,8 @@ class ReporterAgent:
 
     def __init__(self):
         self.jinja_env = Environment(loader=FileSystemLoader(str(TEMPLATES_DIR)), autoescape=False)
+        # Regex test used by the VEX template (Jinja2 has no built-in "search" test).
+        self.jinja_env.tests["search"] = lambda value, pattern: re.search(pattern, str(value)) is not None
 
     def generate_reports(
         self,

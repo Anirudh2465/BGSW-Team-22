@@ -73,6 +73,7 @@ function FindingAnalysisView({ finding }: { finding: Finding }) {
   let title = "";
   let advisory = "";
   let rootCause = "";
+  let aiSummary = "";
   let severityAssessment = "";
   let cvssScore = "";
   let epssLikelihood = "";
@@ -91,6 +92,8 @@ function FindingAnalysisView({ finding }: { finding: Finding }) {
 
     if (line.includes("**Advisory / Identifier**:")) {
       advisory = line.replace(/^[•\-*\s]*\*\*Advisory \/ Identifier\*\*:\s*/, "").trim();
+    } else if (line.includes("**AI Summary (Gemini, grounded)**:")) {
+      aiSummary = line.replace(/^[•\-*\s]*\*\*AI Summary \(Gemini, grounded\)\*\*:\s*/, "").trim();
     } else if (line.includes("**Technical Root Cause**:")) {
       rootCause = line.replace(/^[•\-*\s]*\*\*Technical Root Cause\*\*:\s*/, "").trim();
     } else if (line.includes("**Severity Assessment**:")) {
@@ -228,6 +231,19 @@ function FindingAnalysisView({ finding }: { finding: Finding }) {
           </div>
         </div>
       </div>
+
+      {/* Gemini summary: shown only after every sentence passed the code grounding check */}
+      {aiSummary && (
+        <div className="rounded-xl border border-sky-500/25 bg-sky-500/[0.04] p-4 space-y-2">
+          <div className="flex items-center justify-between gap-2 text-xs font-semibold uppercase tracking-wider text-sky-300">
+            <span>AI Summary</span>
+            <span className="normal-case font-normal text-[11px] text-ink-muted">
+              Gemini · every sentence cites evidence [in brackets]
+            </span>
+          </div>
+          <div className="text-xs md:text-sm leading-relaxed text-ink-soft">{aiSummary}</div>
+        </div>
+      )}
 
       {/* Technical Root Cause & Exploit Mechanism Card */}
       {rootCause && (

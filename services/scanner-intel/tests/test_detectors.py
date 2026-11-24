@@ -374,8 +374,9 @@ def test_detector_runs_every_check_and_passes_the_gate(wired):
     res = agent.detect_findings("r1", wired["sbom"], sinkhole_logs_sha256=wired["sinkhole"],
                                 source_sha256=wired["source"])
     checks = res.cross_check_summary["checks"]
-    assert set(checks) == {"cve", "image_cve", "provenance", "install_hook", "typosquat", "slopsquat", "confusion",
-                           "lockfile", "pinning", "agent_config"}
+    assert set(checks) == {"cve", "reachability", "image_cve", "provenance", "install_hook", "typosquat", "slopsquat",
+                           "confusion", "lockfile", "pinning", "agent_config"}
+    assert checks.pop("reachability")["status"] == "unavailable"  # this SBOM references no class graph
     assert all(c["status"] in ("ok", "not_applicable") for c in checks.values()), checks
     kinds = res.cross_check_summary["by_kind"]
     for kind in ("cve", "install_hook", "typosquat", "slopsquat", "confusion", "lockfile", "pinning", "agent_config"):
