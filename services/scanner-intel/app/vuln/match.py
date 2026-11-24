@@ -64,6 +64,8 @@ def load_sbom(data: Dict[str, Any]) -> Tuple[Dict[str, SbomComponent], Dict[str,
     for c in _walk(data.get("components") or []):
         if meta_ref and c.get("bom-ref") == meta_ref:
             continue
+        if c.get("type") == "container":
+            continue  # base images are assessed separately, from their own SBOM (see detector_agent)
         total += 1
         p = P.parse(c.get("purl", ""))
         label = c.get("purl") or c.get("bom-ref") or c.get("name") or "?"

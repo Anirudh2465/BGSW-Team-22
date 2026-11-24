@@ -71,7 +71,8 @@ def detect(req: DetectRequest):
     return detector_agent.detect_findings(
         run_id=req.run_id,
         sbom_sha256=req.sbom_artifact_sha256,
-        sinkhole_logs_sha256=req.sinkhole_logs_artifact_sha256
+        sinkhole_logs_sha256=req.sinkhole_logs_artifact_sha256,
+        source_sha256=req.source_artifact_sha256,
     )
 
 @app.post("/sbom-diff", response_model=SbomDiffResponse)

@@ -1,5 +1,7 @@
 #!/bin/sh
 # Bake the vulnerability databases into the image (build time only; runs never download).
+# The seed SBOM lists one package per ecosystem the scans need, including Debian, Ubuntu and Alpine
+# OS packages so that base-image SBOMs (stage-2 image scan) can be checked offline too.
 set -eu
 mkdir -p "$GRYPE_DB_CACHE_DIR" "$OSV_SCANNER_LOCAL_DB_CACHE_DIRECTORY"
 GRYPE_DB_AUTO_UPDATE=true grype db update
