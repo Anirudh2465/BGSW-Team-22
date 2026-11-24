@@ -29,6 +29,20 @@ class ArtifactClient:
             raise ArtifactError(f"artifact {sha256[:12]} failed hash verification")
         return res.content
 
+    def put(self, run_id: str, stage: str, media_type: str, content: bytes) -> str:
+        """Store bytes content-addressed (used for the Gemini prompt/response transcript)."""
+        sha = hashlib.sha256(content).hexdigest()
+        headers = {"X-Guardian-Token": self.token} if self.token else {}
+        try:
+            res = httpx.put(f"{self.base_url}/internal/artifacts/{sha}", content=content,
+                            params={"run_id": run_id, "stage": stage, "media_type": media_type},
+                            headers=headers, timeout=self.timeout)
+        except httpx.HTTPError as exc:
+            raise ArtifactError(f"artifact upload failed: {exc}") from exc
+        if res.status_code != 200:
+            raise ArtifactError(f"artifact upload rejected (HTTP {res.status_code}): {res.text[:200]}")
+        return sha
+
 
 class InMemoryArtifactClient:
     """Test double with the same interface."""
@@ -45,6 +59,9 @@ class InMemoryArtifactClient:
         if sha256 not in self.blobs:
             raise ArtifactError(f"artifact {sha256[:12]} not available")
         return self.blobs[sha256]
+
+    def put(self, run_id: str, stage: str, media_type: str, content: bytes) -> str:
+        return self.add(content)
 
 
 artifact_client = ArtifactClient()

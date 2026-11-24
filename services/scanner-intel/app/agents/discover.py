@@ -93,6 +93,12 @@ class DiscoverAgent:
         image_meta = self._images(run_id, bundle, errors)
         if image_meta["containers"]:
             result.sbom.setdefault("components", []).extend(image_meta["containers"])
+        # The class graph is built first so the merged SBOM can reference it: the detector reads it by
+        # hash to assign reachability tiers (no contract change needed).
+        class_meta = self._class_graph(run_id, bundle, scanner_status, errors)
+        if class_meta:
+            result.sbom.setdefault("metadata", {}).setdefault("properties", []).append(
+                {"name": "guardian:class_graph_sha256", "value": class_meta["sha256"]})
         sbom_bytes = canonical_json(result.sbom)
         try:
             sbom_sha256 = artifacts.artifact_client.put(run_id, "discover", CYCLONEDX_MEDIA_TYPE, sbom_bytes)
@@ -103,7 +109,6 @@ class DiscoverAgent:
         syft_meta = self._syft_sbom(run_id, bundle, errors)
         if syft_meta:
             artifacts_meta["syft_sbom"] = syft_meta
-        class_meta = self._class_graph(run_id, bundle, scanner_status, errors)
         if class_meta:
             artifacts_meta["class_graph"] = class_meta
         if image_meta["images"]:

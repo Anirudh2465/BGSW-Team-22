@@ -1,3 +1,10 @@
+{#- OpenVEX statements for CVE findings, following the rectified architecture's VEX rules:
+    - not_affected ONLY with a completed call-graph analysis showing no path (evidence id
+      "reachability:no_path:..."), justification vulnerable_code_not_in_execute_path
+    - under_investigation for advisories only one scanner reported (status "unconfirmed")
+    - affected otherwise, with an action statement
+    Type-level reachability (tier 1/2) never yields not_affected. -#}
+{%- set cves = findings | selectattr("kind", "equalto", "cve") | list -%}
 {
   "@context": "https://openvex.dev/ns/v0.2.0",
   "@id": "urn:guardian:vex:{{ run_id }}",
@@ -5,18 +12,27 @@
   "timestamp": "2026-11-23T14:33:00Z",
   "version": 1,
   "statements": [
-    {% for f in findings %}
+    {% for f in cves %}
+    {%- set no_path = f.evidence | map(attribute="id") | select("search", "^reachability:no_path:") | list -%}
+    {%- set advisory = (f.evidence | map(attribute="id") | select("search", "(CVE|GHSA)-") | first | default(f.id)).split(":")[-1] -%}
     {
       "vulnerability": {
-        "name": "{{ f.evidence[0].id if f.evidence else f.id }}"
+        "name": "{{ advisory }}"
       },
       "products": [
         {
           "@id": "{{ f.purl }}"
         }
       ],
-      "status": "{% if f.reach_tier == 1 and f.score == 0 %}not_affected{% else %}affected{% endif %}",
-      "justification": "{% if f.reach_tier == 1 and f.score == 0 %}vulnerable_code_cannot_be_controlled_by_adversary{% else %}component_present{% endif %}"
+      {%- if no_path and f.reach_tier == 1 %}
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path"
+      {%- elif f.status == "unconfirmed" %}
+      "status": "under_investigation"
+      {%- else %}
+      "status": "affected",
+      "action_statement": "Upgrade {{ f.purl }} to a fixed version (see the remediation plan)."
+      {%- endif %}
     }{% if not loop.last %},{% endif %}
     {% endfor %}
   ]

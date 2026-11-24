@@ -268,7 +268,13 @@ def prioritize_node(state: GuardianState) -> Dict[str, Any]:
     findings_list = list(state.get("findings", {}).values())
     req = PrioritizeRequest(run_id=run_id, findings=findings_list, source_artifact_sha256=state["source_sha256"])
     resp = service_clients.call_prioritize(req)
-    gate_res = {"gate": "grounding_gate", "passed": resp.gate_passed, "scored_count": len(resp.prioritized_findings)}
+    gate_res = {
+        "gate": "grounding_gate", "passed": resp.gate_passed, "scored_count": len(resp.prioritized_findings),
+        # Gemini summaries shown (each passed the per-sentence grounding check) and reachability tiers.
+        "gemini_explained": sum(1 for f in resp.prioritized_findings if any(e.tool == "gemini" for e in f.evidence)),
+        "reach_tiers": {str(t): sum(1 for f in resp.prioritized_findings if f.kind == "cve" and f.reach_tier == t)
+                        for t in (1, 2, 3, None)},
+    }
     audit_chain.record_transition(run_id, "prioritize_node", gate_res)
 
     findings_map = {f.id: f for f in resp.prioritized_findings}

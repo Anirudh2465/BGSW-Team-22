@@ -201,7 +201,7 @@ def format_detailed_finding_explanation(
 ) -> str:
     """Builds an exhaustive, technically rigorous analysis for any finding."""
     effective_score = score if score is not None else (f.score or 50)
-    effective_reach = reach_tier if reach_tier is not None else (f.reach_tier or 1)
+    effective_reach = reach_tier if reach_tier is not None else f.reach_tier  # None = not determined
 
     if effective_score >= 80:
         severity = "CRITICAL"
@@ -330,12 +330,24 @@ def format_detailed_finding_explanation(
         root_cause = f.explanation or f"Supply chain anomaly detected in {purl}."
         remediation = "Review the dependency and apply security controls in accordance with organization policies."
 
-    if effective_reach == 1:
-        reach_desc = "Tier 1 (Confirmed Direct Call Path) — Static AST call-graph confirms the application directly invokes the vulnerable symbols."
+    # Wording follows the architecture: weaker evidence means "unknown", never "safe".
+    reach_ev = next((e.id for e in f.evidence if e.tool == "reachability"), None)
+    reach_detail = f" Evidence: {reach_ev.split(':', 2)[-1]}." if reach_ev else ""
+    if kind != "cve":
+        reach_desc = "Not applicable (supply-chain finding with a fixed starting score)."
+    elif effective_reach == 1:
+        reach_desc = ("Tier 1 (Application Uses This Library) — application code calls or instantiates classes of "
+                      "this library (type-level class-graph evidence; the vulnerable function itself was not traced). "
+                      "Risk raised: R = 20." + reach_detail)
     elif effective_reach == 2:
-        reach_desc = "Tier 2 (Transitive Runtime Import) — Component is imported into the runtime environment via transitive dependency chains."
+        reach_desc = ("Tier 2 (Referenced) — application code references this library's types but no call was "
+                      "found, or only tests use it. Neutral: R = 12." + reach_detail)
+    elif effective_reach == 3:
+        reach_desc = "Tier 3 (Mentioned) — the library is only mentioned in the code. Neutral: R = 12."
     else:
-        reach_desc = "Tier 3 (Shadow / Unreachable) — Dependency resides in unused profiles, test scopes, or unreachable code branches."
+        reach_desc = ("Not Determined — no direct use found in the class graph, or no class graph for this "
+                      "ecosystem. It may still be used through another library; this does NOT mean safe. "
+                      "Neutral: R = 12.")
 
     evidence_summary = ", ".join(f"{e.tool}:{e.id}" for e in f.evidence) or "N/A"
 

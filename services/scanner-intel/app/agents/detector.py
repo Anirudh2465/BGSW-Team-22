@@ -19,10 +19,11 @@ run for an outside reason (registry offline, no source) is recorded as "unavaila
 """
 
 import json
+import re
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from guardian_contracts.api_schemas import DetectResponse
-from guardian_contracts.state import Finding
+from guardian_contracts.state import Evidence, Finding
 
 from .. import artifact_client as artifacts
 from ..artifact_client import ArtifactError
@@ -36,8 +37,12 @@ from ..detectors.provenance import ProvenanceDetector
 from ..detectors.registry_client import RegistryClient
 from ..detectors.slopsquat import SlopsquatDetector, slop_signals
 from ..detectors.squat_confusion import SquatConfusionDetector
+from ..reachability.class_graph_reach import ReachabilityIndex
+from ..sbom import purl as P
 from ..source_tree import SourceTree
 from ..vuln import service as vuln_service
+
+REACHABILITY_TOOL = "reachability"
 
 CheckResult = Tuple[List[Finding], Dict[str, Any]]
 
@@ -101,6 +106,12 @@ class DetectorAgent:
         sbom = self._json_artifact(sbom_sha256)
         components = sbom_components(sbom) if isinstance(sbom, dict) else []
         containers = container_components(sbom) if isinstance(sbom, dict) else []
+
+        # 1b. Reachability tier of each application CVE, from the class graph (only ever raises risk).
+        try:
+            findings, checks["reachability"] = self._reachability(findings, sbom, components, sbom_sha256)
+        except Exception as exc:
+            checks["reachability"] = {"status": "failed", "findings": 0, "error": f"{type(exc).__name__}: {exc}"[:300]}
 
         # 2. Base-image CVEs and signatures.
         run("image_cve", lambda: self._image_cves(run_id, containers))
@@ -171,6 +182,35 @@ class DetectorAgent:
         )
 
     # ------------------------------------------------------------------ checks
+    def _reachability(self, findings: List[Finding], sbom: Any, components, sbom_sha256: str):
+        props = {p.get("name"): p.get("value") for p in ((sbom or {}).get("metadata") or {}).get("properties") or []
+                 if isinstance(p, dict)} if isinstance(sbom, dict) else {}
+        graph_sha = props.get("guardian:class_graph_sha256")
+        payload = self._json_artifact(graph_sha) if graph_sha else None
+        index = ReachabilityIndex(payload if isinstance(payload, dict) else None,
+                                  [(c.namespace, c.name) for c in components if c.ptype == "maven"])
+        counts = {"tier1": 0, "tier2": 0, "not_determined": 0}
+        out: List[Finding] = []
+        for f in findings:
+            parsed = P.parse(f.purl) if f.kind == "cve" else None
+            if not parsed or parsed.type != "maven" or any(str(p).startswith("image:") for p in f.path):
+                out.append(f)
+                continue
+            r = index.reach(parsed.namespace, parsed.name)
+            counts["tier1" if r.tier == 1 else "tier2" if r.tier == 2 else "not_determined"] += 1
+            update: Dict[str, Any] = {"reach_tier": r.tier}
+            if r.tier and graph_sha:
+                edge = re.sub(r"\s+", "", r.examples[0]) if r.examples else "reference"
+                update["evidence"] = list(f.evidence) + [Evidence(
+                    id=f"reachability:tier{r.tier}:{edge}"[:240], tool=REACHABILITY_TOOL, artifact_sha256=graph_sha)]
+            out.append(f.model_copy(update=update))
+        status = "ok" if index.available else ("not_applicable" if index.status == "no_java_sources" else "unavailable")
+        info = {"status": status, "class_graph": index.status,
+                "app_classes": index.app_classes, **counts, "findings": 0}
+        if not index.available:
+            info["error"] = f"class graph {index.status}: tiers not determined (R = 12)"
+        return out, info
+
     def _typosquats(self, components, sbom_sha256: str, registry: RegistryClient) -> CheckResult:
         """Name-similarity findings, raised to confirmed (score 80) when registry data shows the package is new."""
         out: List[Finding] = []
